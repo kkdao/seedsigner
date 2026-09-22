@@ -10,22 +10,32 @@ any one of them still shows up:
 * Sparrow's drongo seed tests (testnet address);
 * kiss-signer's (keys, addresses and the sp(...) scan export for abandon...about).
 """
+import hashlib
+import json
 import logging
+import os
+import random
 import subprocess
+import sys
 import tempfile
+import textwrap
 import time
+from binascii import a2b_base64
+from io import BytesIO
 from unittest.mock import MagicMock
 
 import pytest
 import qrcode
-from embit import bip32, bip39, ec
-from embit.psbt import PSBT
+from embit import bip32, bip39, compact, ec, script
+from embit.networks import NETWORKS
+from embit.psbt import PSBT, DerivationPath
+from embit.transaction import SIGHASH
 
 from base import BaseTest, FlowStep, FlowTest
 from ui_driver import DeferredInput, UISession
 
 from seedsigner.helpers import silent_payments
-from seedsigner.models.psbt_parser import RejectCode
+from seedsigner.models.psbt_parser import InvalidPSBTError, PSBTParser, RejectCode
 from seedsigner.models.seed import AezeedSeed, ElectrumSeed, Seed, Slip39Seed, XprvSeed
 from seedsigner.models.settings_definition import SettingsConstants
 from seedsigner.views import psbt_views, scan_views, seed_views
@@ -104,7 +114,7 @@ SLIP39_XPRV = "xprv9s21ZrQH143K4QViKpwKCpS2zVbz8GrZgpEchMDg6KME9HZtjfL7iThE9w5mu
 
 # kiss-bdk's BIP-376 spend PSBTs (PSBTv2, testnet) for abandon...about. Their inputs
 # carry only the Silent Payments spend fields (PSBT_IN_SP_SPEND_BIP32_DERIVATION and
-# PSBT_IN_SP_TWEAK), which this version cannot sign for.
+# PSBT_IN_SP_TWEAK). 01-03 are signed; 04 carries a tweak that is not this seed's.
 SP_SPEND_PSBTS = {
     "01-sp-spend-1in": (
         "cHNidP8B+wQCAAAAAQIEAgAAAAEDBNAHAAABBAEBAQUBAgEGAQAAAQ4gzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3N"
@@ -484,32 +494,569 @@ class TestAddressRoute(FlowTest):
 
 
 
-class TestSilentPaymentSpendRefused(FlowTest):
-    @pytest.mark.parametrize("name", sorted(SP_SPEND_PSBTS))
-    def test_refused_before_signing(self, name, monkeypatch):
-        signed = []
-        def sign_with(*args, **kwargs):
-            signed.append(name)
-            raise AssertionError("sign_with() reached for a Silent Payments spend")
-        monkeypatch.setattr(PSBT, "sign_with", sign_with)
+# ---- BIP-376: spending a received Silent Payment ------------------------------------
 
-        self.settings.set_value(SettingsConstants.SETTING__NETWORK, TESTNET)
-        self.controller.storage.seeds = [abandon_seed()]
+SECP_P = 2**256 - 2**32 - 977
+SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+SECP_G = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+          0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
 
-        def scan(view):
-            view.decoder.add_data(SP_SPEND_PSBTS[name])
 
-        def assert_refused(view):
-            assert view.code == RejectCode.SEED_CANNOT_SIGN
+def _point_add(p, q):
+    if p is None:
+        return q
+    if q is None:
+        return p
+    if p[0] == q[0] and (p[1] + q[1]) % SECP_P == 0:
+        return None
+    if p == q:
+        lam = 3 * p[0] * p[0] * pow(2 * p[1], SECP_P - 2, SECP_P) % SECP_P
+    else:
+        lam = (q[1] - p[1]) * pow(q[0] - p[0], SECP_P - 2, SECP_P) % SECP_P
+    x = (lam * lam - p[0] - q[0]) % SECP_P
+    return x, (lam * (p[0] - x) - p[1]) % SECP_P
 
-        self.run_sequence([
-            FlowStep(MainMenuView, button_data_selection=MainMenuView.SCAN),
-            FlowStep(scan_views.ScanView, before_run=scan),
-            FlowStep(psbt_views.PSBTSelectSeedView, screen_return_value=0),
-            # The parser refuses it before any review screen, so nothing reaches signing.
-            FlowStep(psbt_views.PSBTOverviewView, is_redirect=True),
-            FlowStep(psbt_views.PSBTSeedCannotSignView, before_run=assert_refused, screen_return_value=0),
-            FlowStep(psbt_views.PSBTSelectSeedView),
-        ])
-        assert signed == []
-        assert self.controller.psbt_parser is None
+
+def _point_mul(point, k):
+    result = None
+    while k:
+        if k & 1:
+            result = _point_add(result, point)
+        point = _point_add(point, point)
+        k >>= 1
+    return result
+
+
+def _tagged_hash(tag: str, data: bytes) -> bytes:
+    tag_hash = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(tag_hash + tag_hash + data).digest()
+
+
+def bip340_verify(xonly: bytes, msg: bytes, sig: bytes) -> bool:
+    """BIP-340's verification algorithm, written out here so the check owes nothing to embit."""
+    x = int.from_bytes(xonly, "big")
+    y_sq = (pow(x, 3, SECP_P) + 7) % SECP_P
+    y = pow(y_sq, (SECP_P + 1) // 4, SECP_P)
+    if x >= SECP_P or y * y % SECP_P != y_sq or len(sig) != 64:
+        return False
+    pub = (x, y if y % 2 == 0 else SECP_P - y)
+    r, s = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
+    if r >= SECP_P or s >= SECP_N:
+        return False
+    e = int.from_bytes(_tagged_hash("BIP0340/challenge", sig[:32] + xonly + msg), "big") % SECP_N
+    point = _point_add(_point_mul(SECP_G, s), _point_mul(pub, SECP_N - e))
+    return point is not None and point[1] % 2 == 0 and point[0] == r
+
+
+def xonly_of(d: int) -> bytes:
+    return _point_mul(SECP_G, d)[0].to_bytes(32, "big")
+
+
+def has_odd_y(d: int) -> bool:
+    return _point_mul(SECP_G, d)[1] % 2 == 1
+
+
+# kiss-signer main/sp_spend_vectors.h: (psbt, tweak byte, output key, BIP-341 sighash)
+KISS_SPEND_VECTORS = {
+    "even": (
+        "cHNidP8BAgQCAAAAAQQBAQEFAQEBBgEAAfsEAgAAAAABASughgEAAAAAACJRIIMurGbsvPwAdYppsX8l1ILmxP9KVbSs/IMcFY+Q5XolAQ4gzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0BDwQAAAAAARAE/v///yIfAoMwhcmnFtNrRnVSwA1qqL1C45rb6YsFvCAxEBdxkvcCGHPF2gpgAQCAAQAAgAAAAIAAAACAAAAAAAEgIAICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAAEDCBhzAQAAAAAAAQQWABQvNKoc8ApTsFWikaA6fUXwppiLUgA=",
+        0x02, "832eac66ecbcfc00758a69b17f25d482e6c4ff4a55b4acfc831c158f90e57a25",
+        "116f2e2f84c78c68b33d4ce1bf82c8461f6e7b54136b89623ac2a759d48a05ff",
+    ),
+    "odd": (
+        "cHNidP8BAgQCAAAAAQQBAQEFAQEBBgEAAfsEAgAAAAABASughgEAAAAAACJRIL1XnhVbVq3gxJvWxirHoSAiTbr8PvlFBVljxOIgFtKPAQ4gzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0BDwQAAAAAARAE/v///yIfAoMwhcmnFtNrRnVSwA1qqL1C45rb6YsFvCAxEBdxkvcCGHPF2gpgAQCAAQAAgAAAAIAAAACAAAAAAAEgIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAAEDCBhzAQAAAAAAAQQWABQvNKoc8ApTsFWikaA6fUXwppiLUgA=",
+        0x01, "bd579e155b56ade0c49bd6c62ac7a120224dbafc3ef945055963c4e22016d28f",
+        "4b91a4474619202c813696358e676a913e831587c71b2abdf6b31c446023aea9",
+    ),
+}
+KISS_SPEND_FOREIGN = "cHNidP8BAgQCAAAAAQQBAQEFAQEBBgEAAfsEAgAAAAABASughgEAAAAAACJRIIMurGbsvPwAdYppsX8l1ILmxP9KVbSs/IMcFY+Q5XolAQ4gzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0BDwQAAAAAARAE/v///yIfAoMwhcmnFtNrRnVSwA1qqL1C45rb6YsFvCAxEBdxkvcCGHPF2gpgAQCAAQAAgAAAAIAAAACAAAAAAAEgIHd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3AAEDCBhzAQAAAAAAAQQWABQvNKoc8ApTsFWikaA6fUXwppiLUgA="
+
+SIGNED_FIXTURES = ["01-sp-spend-1in", "02-sp-spend-2in", "03-sp-spend-odd"]
+SPEND_KEY_TYPE = 0x1F
+
+
+def sp_psbt(name: str) -> PSBT:
+    return PSBT.parse(a2b_base64(SP_SPEND_PSBTS[name]))
+
+
+def reparse(p: PSBT) -> PSBT:
+    """Round-trip through bytes, so embit files each field where a scanned psbt would have it."""
+    return PSBT.parse(p.serialize())
+
+
+def b_spend() -> int:
+    """The abandon...about testnet spend private key, m/352'/1'/0'/0'/0."""
+    root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(" ".join(ABANDON)))
+    return int.from_bytes(root.derive("m/352h/1h/0h/0h/0").key.secret, "big")
+
+
+def spend_key_field(inp):
+    return next(k for k in inp.unknown if k[0] == SPEND_KEY_TYPE)
+
+
+def set_spend(inp, tweak: int, d: int = None):
+    """Give an input tweak `tweak`, and a P2TR prevout paying x(d*G) (by default, b_spend + tweak)."""
+    inp.unknown[b"\x20"] = tweak.to_bytes(32, "big")
+    d = (b_spend() + tweak) % SECP_N if d is None else d
+    inp.witness_utxo.script_pubkey = script.Script(b"\x51\x20" + xonly_of(d))
+
+
+def raw_maps(data: bytes) -> list[dict]:
+    """Every key-value map of a serialized psbt, in order, read straight from the bytes."""
+    stream = BytesIO(data[5:])
+    maps, current = [], {}
+    while stream.tell() < len(data) - 5:
+        key = stream.read(compact.read_from(stream))
+        if not key:
+            maps.append(current)
+            current = {}
+            continue
+        assert key not in current
+        current[key] = stream.read(compact.read_from(stream))
+    return maps
+
+
+def assert_only_signatures_added(before: bytes, after: bytes, num_inputs: int):
+    """`after` holds every key-value pair of `before`, unchanged, plus one 64-byte 0x13 per input."""
+    old, new = raw_maps(before), raw_maps(after)
+    assert len(old) == len(new)
+    for i, (a, b) in enumerate(zip(old, new)):
+        added = {k: v for k, v in b.items() if k not in a}
+        assert {k: b[k] for k in a} == a
+        if 1 <= i <= num_inputs:
+            assert list(added) == [b"\x13"] and len(added[b"\x13"]) == 64
+        else:
+            assert added == {}
+
+
+def assert_signatures_verify(p: PSBT):
+    for i, inp in enumerate(p.inputs):
+        sig = inp.unknown[b"\x13"]
+        assert len(sig) == 64
+        msg = p.sighash(i, sighash=SIGHASH.DEFAULT)
+        assert bip340_verify(inp.witness_utxo.script_pubkey.data[2:], msg, sig)
+
+
+def parse_testnet(p: PSBT, seed=None) -> PSBTParser:
+    return PSBTParser(p, seed=seed or abandon_seed(), network=TESTNET)
+
+
+def assert_refused(p: PSBT, code: str, seed=None, match: str = None):
+    with pytest.raises(InvalidPSBTError, match=match) as e:
+        parse_testnet(reparse(p), seed)
+    assert e.value.code == code
+    return e.value
+
+
+class TestSpendSigning:
+    @pytest.mark.parametrize("name", SIGNED_FIXTURES)
+    def test_kiss_bdk_fixtures_are_signed_losslessly(self, name, monkeypatch):
+        monkeypatch.setattr(PSBT, "sign_with", MagicMock(side_effect=AssertionError("sign_with()")))
+        raw = a2b_base64(SP_SPEND_PSBTS[name])
+        p = PSBT.parse(raw)
+        parser = parse_testnet(p)
+        assert parser.silent_payment_inputs == [True] * len(p.inputs)
+        assert PSBTParser.sig_count(p) == 0
+
+        assert silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET) == len(p.inputs)
+        assert PSBTParser.sig_count(p) == len(p.inputs)
+        assert_signatures_verify(p)
+        assert_only_signatures_added(raw, p.serialize(), len(p.inputs))
+        assert p.version == 2
+
+    def test_foreign_tweak_refused_before_signing(self):
+        p = sp_psbt("04-sp-spend-foreign-tweak")
+        assert_refused(p, RejectCode.FOREIGN_SILENT_PAYMENT)
+        before = p.serialize()
+        with pytest.raises(ValueError):
+            silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
+        assert p.serialize() == before
+
+    @pytest.mark.parametrize("name", sorted(KISS_SPEND_VECTORS))
+    def test_kiss_signer_vectors(self, name):
+        b64, tweak_byte, outkey, sighash = KISS_SPEND_VECTORS[name]
+        p = PSBT.from_base64(b64)
+        parse_testnet(p)
+        assert p.sighash(0, sighash=SIGHASH.DEFAULT).hex() == sighash
+        key = silent_payments.spend_signing_key(abandon_seed(), TESTNET, p.inputs[0])
+        d = (b_spend() + int.from_bytes(bytes([tweak_byte]) * 32, "big")) % SECP_N
+        # The key is d itself, never negated by the helper, whichever Y parity d*G has.
+        assert key.secret == d.to_bytes(32, "big")
+        assert has_odd_y(d) == (name == "odd")
+        assert key.xonly().hex() == outkey
+        silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
+        assert bip340_verify(bytes.fromhex(outkey), bytes.fromhex(sighash), p.inputs[0].unknown[b"\x13"])
+
+    def test_kiss_signer_foreign_vector_refused(self):
+        assert_refused(PSBT.from_base64(KISS_SPEND_FOREIGN), RejectCode.FOREIGN_SILENT_PAYMENT)
+
+    @pytest.mark.parametrize("backend", ["ctypes", "python"])
+    def test_both_secp256k1_backends_sign_both_parities(self, backend):
+        """
+        embit picks libsecp256k1 through ctypes when it loads and falls back to its
+        pure-Python maths otherwise (embit/util/secp256k1.py). Neither may need the
+        helper to negate d for an odd-Y output key, so each signs every fixture in a
+        fresh interpreter, and each signature is checked here.
+        """
+        code = textwrap.dedent("""
+            import json, sys
+            if sys.argv[1] == "python":
+                sys.modules["embit.util.ctypes_secp256k1"] = None  # makes the import fail
+            from binascii import a2b_base64
+            from embit.psbt import PSBT
+            from embit.util import secp256k1
+            from seedsigner.helpers import silent_payments
+            from seedsigner.models.seed import Seed
+            from seedsigner.models.settings_definition import SettingsConstants
+            seed = Seed(["abandon"] * 11 + ["about"])
+            out = {"backend": secp256k1.schnorrsig_sign.__module__, "signed": {}}
+            for name, b64 in json.loads(sys.stdin.read()).items():
+                p = PSBT.parse(a2b_base64(b64))
+                silent_payments.sign_spend_inputs(p, seed, SettingsConstants.TESTNET)
+                out["signed"][name] = p.to_base64()
+            print(json.dumps(out))
+        """)
+        inputs = {name: SP_SPEND_PSBTS[name] for name in SIGNED_FIXTURES}
+        inputs.update({name: KISS_SPEND_VECTORS[name][0] for name in KISS_SPEND_VECTORS})
+        result = subprocess.run(
+            [sys.executable, "-c", code, backend], input=json.dumps(inputs),
+            capture_output=True, text=True, check=True, timeout=300,
+            env={**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src")},
+        )
+        out = json.loads(result.stdout)
+        expected = {"ctypes": "embit.util.ctypes_secp256k1", "python": "embit.util.py_secp256k1"}
+        assert out["backend"] == expected[backend]
+        parities = set()
+        for name, b64 in out["signed"].items():
+            p = PSBT.from_base64(b64)
+            assert_signatures_verify(p)
+            for inp in p.inputs:
+                d = (b_spend() + int.from_bytes(inp.unknown[b"\x20"], "big")) % SECP_N
+                parities.add(has_odd_y(d))
+        assert parities == {True, False}
+
+    def test_random_non_symmetric_tweaks(self):
+        rng = random.Random(376)
+        parities = set()
+        while parities != {True, False}:
+            p = sp_psbt("02-sp-spend-2in")
+            for inp in p.inputs:
+                tweak = rng.randrange(1, SECP_N)
+                set_spend(inp, tweak)
+                parities.add(has_odd_y((b_spend() + tweak) % SECP_N))
+            p = reparse(p)
+            parse_testnet(p)
+            silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
+            assert_signatures_verify(p)
+
+    def test_tweak_n_minus_one_is_signed(self):
+        p = sp_psbt("01-sp-spend-1in")
+        set_spend(p.inputs[0], SECP_N - 1)
+        p = reparse(p)
+        parse_testnet(p)
+        silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
+        assert_signatures_verify(p)
+
+    @pytest.mark.parametrize("case", ["t=0", "t=n", "t=2^256-1", "b_spend+t=0", "off-by-one"])
+    def test_scalar_boundaries_refused(self, case):
+        b = b_spend()
+        p = sp_psbt("01-sp-spend-1in")
+        inp = p.inputs[0]
+        if case == "t=0":
+            set_spend(inp, 0)          # the output key is the bare spend key
+        elif case == "t=n":
+            set_spend(inp, SECP_N)     # the same key again, reached by t = n
+        elif case == "t=2^256-1":
+            set_spend(inp, 2**256 - 1)
+        elif case == "b_spend+t=0":
+            set_spend(inp, SECP_N - b, d=b)
+        else:
+            set_spend(inp, 0x0202020202020202020202020202020202020202020202020202020202020203, d=b + 0x0202020202020202020202020202020202020202020202020202020202020202)
+        assert_refused(p, RejectCode.FOREIGN_SILENT_PAYMENT)
+        with pytest.raises(ValueError):
+            silent_payments.sign_spend_inputs(reparse(p), abandon_seed(), TESTNET)
+
+    def test_late_failure_leaves_psbt_unchanged(self, monkeypatch):
+        """A signature that fails its check on the second input: nothing is written to either."""
+        p = sp_psbt("02-sp-spend-2in")
+        parse_testnet(p)
+        before = p.serialize()
+        real_sign = ec.PrivateKey.schnorr_sign
+        calls = []
+        def sign(key, msg):
+            calls.append(msg)
+            sig = real_sign(key, msg)
+            return sig if len(calls) == 1 else real_sign(key, bytes(32))
+        monkeypatch.setattr(ec.PrivateKey, "schnorr_sign", sign)
+        with pytest.raises(ValueError):
+            silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
+        assert len(calls) == 2
+        assert p.serialize() == before
+        assert all(b"\x13" not in inp.unknown for inp in p.inputs)
+
+    def test_master_xprv_signs(self):
+        p = sp_psbt("01-sp-spend-1in")
+        xprv = XprvSeed(KISS_MASTER_TPRV)
+        parse_testnet(p, xprv)
+        silent_payments.sign_spend_inputs(p, xprv, TESTNET)
+        assert_signatures_verify(p)
+
+
+class TestSpendRefusals:
+    @pytest.mark.parametrize("sighash", [0x01, 0x02, 0x03, 0x80, 0x81, 0x82, 0x83])
+    def test_only_sighash_default(self, sighash):
+        p = sp_psbt("01-sp-spend-1in")
+        p.inputs[0].sighash_type = sighash
+        assert_refused(p, RejectCode.UNSUPPORTED_SIGHASH)
+
+    def test_explicit_sighash_default_is_signed(self):
+        p = sp_psbt("01-sp-spend-1in")
+        p.inputs[0].sighash_type = 0x00
+        p = reparse(p)
+        parse_testnet(p)
+        silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
+        assert_signatures_verify(p)
+
+    @pytest.mark.parametrize("scope, key", [
+        ("global", b"\x07" + bytes.fromhex(KISS_KEYS[TESTNET][0])),
+        ("global", b"\x08" + bytes.fromhex(KISS_KEYS[TESTNET][0])),
+        ("input", b"\x1d" + bytes.fromhex(KISS_KEYS[TESTNET][0])),
+        ("input", b"\x1e" + bytes.fromhex(KISS_KEYS[TESTNET][0])),
+        ("output", b"\x09"),
+        ("output", b"\x0a"),
+    ])
+    def test_send_fields_refused_before_the_output_check(self, scope, key):
+        """BIP-375 fields are refused first, even on a psbt whose output has no script."""
+        p = sp_psbt("01-sp-spend-1in")
+        p.outputs[0].script_pubkey = None
+        {"global": p, "input": p.inputs[0], "output": p.outputs[1]}[scope].unknown[key] = b"\x01" * 33
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="Sending to Silent Payment")
+
+    def test_send_fields_refused_on_ordinary_psbt(self):
+        p = PSBT.from_base64(KISS_SPEND_VECTORS["even"][0])
+        for key in list(p.inputs[0].unknown):
+            del p.inputs[0].unknown[key]
+        p.outputs[0].unknown[b"\x09"] = b"\x01" * 66
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="Sending to Silent Payment")
+
+    def test_v0_refused(self):
+        p = sp_psbt("01-sp-spend-1in")
+        p.version = None
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="v2")
+
+    def test_mixed_inputs_refused(self):
+        p = sp_psbt("02-sp-spend-2in")
+        p.inputs[1].unknown.clear()
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="mixed")
+
+    def test_omitted_sequence_is_hashed_as_final_and_exported_explicitly(self):
+        """
+        BIP-370 reads an omitted PSBT_IN_SEQUENCE as 0xffffffff, and that is what embit
+        hashes. But embit fills the value in while parsing, so an omitted field can't be
+        told from an explicit one, and can't be refused: the export then carries it
+        explicitly. Pinned here as the one field the export doesn't return as it came.
+        """
+        p = sp_psbt("01-sp-spend-1in")
+        p.inputs[0].sequence = None
+        raw = p.serialize()
+        assert b"\x10" not in raw_maps(raw)[1]
+        p = PSBT.parse(raw)
+        assert p.inputs[0].sequence == 0xFFFFFFFF
+        parse_testnet(p)
+        silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
+        assert_signatures_verify(p)
+        signed = raw_maps(p.serialize())[1]
+        assert signed.pop(b"\x10") == b"\xff" * 4
+        signed.pop(b"\x13")
+        assert signed == raw_maps(raw)[1]
+
+    @pytest.mark.parametrize("change", [
+        "sequence zero", "min time", "min height", "no tx version",
+    ])
+    def test_fields_embit_would_not_hash_as_written_are_refused(self, change):
+        """
+        embit builds the hashed transaction with `sequence or 0xffffffff` and
+        `tx_version or 2`, and ignores BIP-370's per-input lock times. Each of those
+        would sign a transaction other than the one the psbt describes. (An existing
+        signature would make the count of new ones meaningless.)
+        """
+        p = sp_psbt("01-sp-spend-1in")
+        inp = p.inputs[0]
+        if change == "sequence zero":
+            inp.sequence = 0
+        elif change == "min time":
+            inp.unknown[b"\x11"] = (500_000_000).to_bytes(4, "little")
+        elif change == "min height":
+            inp.unknown[b"\x12"] = (100).to_bytes(4, "little")
+        else:
+            p.tx_version = None
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT)
+
+    @pytest.mark.parametrize("change", [
+        "orphan spend key", "orphan tweak", "two spend keys", "short tweak", "long tweak",
+        "tweak key data", "ragged path", "no fingerprint", "invalid point", "short spend key",
+    ])
+    def test_malformed_fields_refused(self, change):
+        p = sp_psbt("01-sp-spend-1in")
+        inp = p.inputs[0]
+        key = spend_key_field(inp)
+        if change == "orphan spend key":
+            del inp.unknown[b"\x20"]
+        elif change == "orphan tweak":
+            del inp.unknown[key]
+        elif change == "two spend keys":
+            inp.unknown[b"\x1f" + bytes.fromhex(KISS_KEYS[TESTNET][0])] = inp.unknown[key]
+        elif change == "short tweak":
+            inp.unknown[b"\x20"] = bytes(31)
+        elif change == "long tweak":
+            inp.unknown[b"\x20"] += b"\x00"
+        elif change == "tweak key data":
+            inp.unknown[b"\x20\x00"] = inp.unknown.pop(b"\x20")
+        elif change == "ragged path":
+            inp.unknown[key] += b"\x00"
+        elif change == "no fingerprint":
+            inp.unknown[key] = b"\x73\xc5\xda"
+        elif change == "invalid point":
+            inp.unknown[b"\x1f\x02" + bytes(32)] = inp.unknown.pop(key)
+        else:
+            inp.unknown[key[:-1]] = inp.unknown.pop(key)
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="malformed")
+
+    @pytest.mark.parametrize("change", [
+        "parity flipped", "other key", "mainnet path", "account 1", "receive branch", "short path", "p2wpkh utxo",
+    ])
+    def test_claims_naming_this_seed_that_fail_are_refused(self, change):
+        p = sp_psbt("01-sp-spend-1in")
+        inp = p.inputs[0]
+        key = spend_key_field(inp)
+        origin = inp.unknown[key]
+        path = lambda *idx: origin[:4] + b"".join(i.to_bytes(4, "little") for i in idx)
+        H = 0x80000000
+        if change == "parity flipped":
+            assert key[1] == 0x02
+            inp.unknown[b"\x1f\x03" + key[2:]] = inp.unknown.pop(key)
+        elif change == "other key":
+            inp.unknown[b"\x1f" + bytes.fromhex(KISS_KEYS[TESTNET][0])] = inp.unknown.pop(key)
+        elif change == "mainnet path":
+            inp.unknown[key] = path(H + 352, H + 0, H, H, 0)
+        elif change == "account 1":
+            inp.unknown[key] = path(H + 352, H + 1, H + 1, H, 0)
+        elif change == "receive branch":
+            inp.unknown[key] = path(H + 352, H + 1, H, H + 1, 0)
+        elif change == "short path":
+            inp.unknown[key] = path(H + 352, H + 1, H)
+        else:
+            inp.witness_utxo.script_pubkey = script.Script(b"\x00\x14" + bytes(20))
+        assert_refused(p, RejectCode.FOREIGN_SILENT_PAYMENT)
+
+    def test_another_seeds_inputs_mean_choose_another_seed(self):
+        p = sp_psbt("02-sp-spend-2in")
+        other = abandon_seed("TREZOR")
+        assert_refused(p, RejectCode.SEED_CANNOT_SIGN, seed=other)
+        assert not PSBTParser.has_matching_input_fingerprint(p, other, TESTNET)
+        assert PSBTParser.has_matching_input_fingerprint(p, abandon_seed(), TESTNET)
+
+    def test_partly_another_seeds_inputs_refused(self):
+        p = sp_psbt("02-sp-spend-2in")
+        inp = p.inputs[1]
+        key = spend_key_field(inp)
+        inp.unknown[key] = bytes.fromhex(abandon_seed("TREZOR").get_fingerprint(TESTNET)) + inp.unknown[key][4:]
+        assert_refused(p, RejectCode.FOREIGN_SILENT_PAYMENT)
+
+    @pytest.mark.parametrize("signer", ["wif", "child-xprv", "electrum", "regtest"])
+    def test_unsupported_signers_refused(self, signer, monkeypatch):
+        from seedsigner.models.wif import WIFKey
+        monkeypatch.setattr(silent_payments, "spend_signing_key", MagicMock(side_effect=AssertionError("derived")))
+        p = reparse(sp_psbt("01-sp-spend-1in"))
+        network = TESTNET
+        if signer == "wif":
+            seed = WIFKey(ec.PrivateKey(b"\x01" * 32, network=NETWORKS["test"]).wif())
+        elif signer == "child-xprv":
+            seed = child_xprv_seed()
+        elif signer == "electrum":
+            seed = ElectrumSeed(ELECTRUM_MNEMONIC.split())
+        else:
+            seed, network = abandon_seed(), REGTEST
+        with pytest.raises(InvalidPSBTError) as e:
+            PSBTParser(p, seed=seed, network=network)
+        assert e.value.code == RejectCode.UNSUPPORTED_SILENT_PAYMENT
+
+    def test_seedless_parse_refused(self):
+        p = reparse(sp_psbt("01-sp-spend-1in"))
+        with pytest.raises(InvalidPSBTError) as e:
+            PSBTParser(p).parse()
+        assert e.value.code == RejectCode.UNSUPPORTED_SILENT_PAYMENT
+
+    @pytest.mark.parametrize("key", [b"\x13x", b"\x20\x00", b"\x1cx", b"\xfcfake", b"\x11\x12"])
+    def test_unexpected_input_fields_refused(self, key):
+        """
+        A key whose type byte is one embit reads, but whose length is not, is a field
+        this signer would skip and a strict coordinator would read: no BIP-376 input
+        carries anything but its own two fields.
+        """
+        p = sp_psbt("01-sp-spend-1in")
+        p.inputs[0].unknown[key] = b"\x00" * 4
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT)
+
+    @pytest.mark.parametrize("key", [b"\x04x", b"\x06\x00", b"\xfcfake", b"\x07x"])
+    def test_unexpected_global_fields_refused(self, key):
+        p = sp_psbt("01-sp-spend-1in")
+        p.unknown[key] = b"\x00" * 4
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT)
+
+    @pytest.mark.parametrize("flags", [b"\x01", b"\x02", b"\x04", b"\x80"])
+    def test_any_modifiable_flag_refused(self, flags):
+        """Not just the input/output bits: a coordinator rejects a response whose
+        PSBT_GLOBAL_TX_MODIFIABLE is anything but zero."""
+        p = sp_psbt("01-sp-spend-1in")
+        p.unknown[b"\x06"] = flags
+        assert_refused(p, RejectCode.TX_MODIFIABLE)
+
+    @pytest.mark.parametrize("field", [
+        "partial sig", "final scriptsig", "final scriptwitness", "tap key sig",
+        "tap script sig", "tap leaf script", "tap bip32 derivation",
+        "tap internal key", "tap merkle root",
+    ])
+    def test_inputs_carrying_signature_or_script_data_refused(self, field):
+        """
+        Anything already signed, finalized or built for a script path would make the
+        count of new signatures meaningless, or come back as a response the coordinator
+        refuses. A BIP-376 input is a bare key-path spend.
+        """
+        from embit.script import Witness
+
+        p = sp_psbt("01-sp-spend-1in")
+        inp = p.inputs[0]
+        pub = ec.PrivateKey(b"\x01" * 32).get_public_key()
+        if field == "partial sig":
+            inp.partial_sigs[pub] = b"\x30" * 71 + b"\x01"
+        elif field == "final scriptsig":
+            inp.final_scriptsig = script.Script(b"\x51")
+        elif field == "final scriptwitness":
+            inp.final_scriptwitness = Witness([bytes(64)])
+        elif field == "tap key sig":
+            inp.unknown[b"\x13"] = bytes(64)
+        elif field == "tap script sig":
+            inp.taproot_sigs[(pub, bytes(32))] = bytes(64)
+        elif field == "tap leaf script":
+            inp.taproot_scripts[b"\xc0" + bytes(32)] = b"\x51\xc0"
+        elif field == "tap bip32 derivation":
+            inp.taproot_bip32_derivations[pub] = ([], DerivationPath(bytes(4), [0]))
+        elif field == "tap internal key":
+            inp.taproot_internal_key = pub
+        else:
+            inp.taproot_merkle_root = bytes(32)
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT)
+
+    def test_taproot_change_refused_todays_way(self):
+        """PR 2 signs spends with no change back to this seed; tr() change stays unreachable."""
+        p = sp_psbt("01-sp-spend-1in")
+        root = abandon_seed().get_root(TESTNET)
+        change = root.derive("m/86h/1h/0h/1/0")
+        out = p.outputs[1]
+        out.bip32_derivations.clear()
+        out.script_pubkey = script.p2tr(change.get_public_key())
+        out.taproot_bip32_derivations[change.get_public_key()] = (
+            [], DerivationPath(root.my_fingerprint, bip32.parse_path("m/86h/1h/0h/1/0")))
+        assert_refused(p, RejectCode.UNREACHABLE_CHANGE_PATH)
+

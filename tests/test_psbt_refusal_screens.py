@@ -189,6 +189,30 @@ class TestSyntheticRefusalMessagesFit:
         assert_fits("Output 999 script cannot be shown as an address.",
                     "UNDISPLAYABLE_OUTPUT")
 
+    @pytest.mark.parametrize("message", [
+        "Sending to Silent Payment addresses isn't supported yet.",
+        "Silent Payment spends need a v2 PSBT.",
+        "Silent Payment inputs can't be mixed with others.",
+        "This PSBT has no transaction version.",
+        "Input 999 needs sighash 0x83, not SIGHASH_DEFAULT.",
+        "Input 999 has no sequence number.",
+        "Input 999 sets its own lock time.",
+        "Input 999 is already signed.",
+        "Input 999 has malformed Silent Payment fields.",
+        "Input 999 carries signature or script data.",
+        "Input 999 carries a field of its own.",
+        "This PSBT carries a global field of its own.",
+        "This transaction can still be changed after you sign.",
+        "This signer can't sign Silent Payment inputs.",
+        "Smartcards can't sign Silent Payment transactions.",
+        "Silent Payments needs a master key, not a derived xprv.",
+        "This seed type has no Silent Payments account.",
+        "Silent Payments needs mainnet or testnet.",
+    ])
+    def test_silent_payment_messages_fit(self, message):
+        # Worst case is a large input index; the messages are otherwise fixed.
+        assert_fits(message, "UNSUPPORTED_SILENT_PAYMENT")
+
     def test_unsupported_psbt_version_message_fits(self):
         assert_fits("PSBT version 4294967295 is not supported.",
                     "UNSUPPORTED_PSBT_VERSION")
