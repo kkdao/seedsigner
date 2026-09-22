@@ -806,11 +806,11 @@ class PSBTParser():
         transaction, so a psbt with no output script still gets this reason first.
 
         Any BIP-375 (send) field in any map is refused. A psbt with BIP-376 spend
-        fields must be v2 with every input a spend (kiss-bdk's spspend.rs rule) and
-        signed with SIGHASH_DEFAULT. embit hashes the transaction with `sequence or
-        0xffffffff` and `tx_version or 2` and ignores BIP-370's per-input lock
-        times, so a psbt relying on any of those is refused rather than signed as a
-        different transaction.
+        fields must be v2 with every input a spend (kiss-bdk's spspend.rs rule),
+        signed with SIGHASH_DEFAULT, and answerable with its own bytes. embit hashes
+        the transaction with `sequence or 0xffffffff` and `tx_version or 2` and
+        ignores BIP-370's per-input lock times, so a psbt relying on any of those is
+        refused rather than signed as a different transaction.
 
         Each input must be a bare key-path spend, and neither it nor the global map
         may carry anything else: a field already holding a signature or a script
@@ -831,6 +831,8 @@ class PSBTParser():
             refuse("Silent Payment inputs can't be mixed with others.")
         if not self.psbt.tx_version:
             refuse("This PSBT has no transaction version.")
+        if not silent_payments.has_own_bytes(self.psbt):
+            refuse("Silent Payment spends need the PSBT as received.")
         if any(self.psbt.unknown.get(b"\x06", b"")):
             # Not just the inputs/outputs bits _check_tx_modifiable reads: a
             # coordinator refuses a response whose flags are anything but zero.

@@ -44,7 +44,7 @@ from seedsigner.gui.screens.tools_screens import (
 )
 from seedsigner.gui.screens.screen import ButtonOption
 from seedsigner.hardware.microsd import MicroSD
-from seedsigner.helpers import embit_utils, ndef_helper, satodime_coins, seedkeeper_utils
+from seedsigner.helpers import embit_utils, ndef_helper, satodime_coins, seedkeeper_utils, silent_payments
 from seedsigner.helpers.satochip_signer import (
     _call_with_timeout,
     _get_extended_key,
@@ -3553,6 +3553,8 @@ class ToolsSatochipLoadPsbtView(View):
         try:
             psbt_data = selected_path.read_bytes()
             psbt = PSBT.parse(psbt_data)
+            # See decode_qr.get_psbt: a Silent Payment spend is answered with these bytes.
+            silent_payments.remember_bytes(psbt, psbt_data)
         except Exception as e:
             logger.exception("Failed to load PSBT from microSD", exc_info=e)
             self.run_screen(

@@ -15,6 +15,7 @@ from seedsigner.helpers.ur2.ur_encoder import UREncoder
 from seedsigner.helpers.ur2.ur import UR
 from seedsigner.helpers.ur2.cbor_lite import CBOREncoder
 from urtypes.bytes import Bytes
+from seedsigner.helpers import silent_payments
 from seedsigner.helpers.qr import QR
 from seedsigner.models.seed import Seed
 from seedsigner.models.settings import SettingsConstants
@@ -427,7 +428,9 @@ class UrPsbtQrEncoder(BaseFountainQrEncoder):
 
     def __post_init__(self):
         super().__post_init__()
-        qr_ur_bytes = UR("crypto-psbt", UR_PSBT(self.psbt.serialize()).to_cbor())
+        # psbt_bytes, not serialize(): a signed Silent Payment spend goes back as
+        # the bytes it came in as, with only its signatures added.
+        qr_ur_bytes = UR("crypto-psbt", UR_PSBT(silent_payments.psbt_bytes(self.psbt)).to_cbor())
         self.ur2_encode = UREncoder(ur=qr_ur_bytes, max_fragment_len=self.qr_max_fragment_size)
 
 

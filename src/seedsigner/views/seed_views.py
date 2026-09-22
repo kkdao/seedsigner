@@ -2928,7 +2928,7 @@ class SeedSilentPaymentsNoticeView(View):
             title=_("Silent Payments"),
             status_icon_size=0,  # Leaves room for the whole notice
             status_headline=_("Experimental"),
-            text=_("This version can't spend Silent Payment coins yet. Recovering them needs a Silent Payments wallet that scans from before the first payment."),
+            text=_("Spending received payments is new here, and paying TO a Silent Payment address isn't supported yet."),
         )
 
         if selected_menu_num == RET_CODE__BACK_BUTTON:
@@ -3005,7 +3005,10 @@ class SeedSilentPaymentsShareCheckView(View):
 
 
 class SeedSilentPaymentsAddressView(View):
-    """The public address. Nothing on this route derives or holds the private scan key."""
+    """
+    The public address. Building it derives the scan key inside the helper, which
+    returns only the address, so nothing on this route holds, shows or exports it.
+    """
     def __init__(self, seed: Seed):
         super().__init__()
         self.seed = seed

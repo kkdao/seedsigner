@@ -456,12 +456,17 @@ class TestAddressRoute(FlowTest):
         assert kwargs["address"] == address
         assert kwargs["fingerprint"] == "73c5da0a"
 
-    def test_address_route_never_touches_the_scan_key(self, caplog, monkeypatch):
+    def test_address_route_never_exports_the_scan_key(self, caplog, monkeypatch):
+        """
+        Building the address derives the scan key inside the helper, which returns only
+        the address. Nothing on this route asks for the export, and neither the key nor
+        the export reaches a log line, a view's args or the back stack.
+        """
         from seedsigner.models import encode_qr
 
         caplog.set_level(logging.DEBUG)
         def no_scan_key(*args, **kwargs):
-            raise AssertionError("the address route derived the scan-key export")
+            raise AssertionError("the address route built the scan-key export")
         monkeypatch.setattr(silent_payments, "scan_key_export", no_scan_key)
 
         drawn = []
@@ -575,13 +580,20 @@ SIGNED_FIXTURES = ["01-sp-spend-1in", "02-sp-spend-2in", "03-sp-spend-odd"]
 SPEND_KEY_TYPE = 0x1F
 
 
+def parse_kept(raw: bytes) -> PSBT:
+    """Parse a psbt the way a scan does, keeping the bytes it came in as."""
+    p = PSBT.parse(raw)
+    silent_payments.remember_bytes(p, raw)
+    return p
+
+
 def sp_psbt(name: str) -> PSBT:
-    return PSBT.parse(a2b_base64(SP_SPEND_PSBTS[name]))
+    return parse_kept(a2b_base64(SP_SPEND_PSBTS[name]))
 
 
 def reparse(p: PSBT) -> PSBT:
     """Round-trip through bytes, so embit files each field where a scanned psbt would have it."""
-    return PSBT.parse(p.serialize())
+    return parse_kept(p.serialize())
 
 
 def b_spend() -> int:
@@ -616,17 +628,29 @@ def raw_maps(data: bytes) -> list[dict]:
     return maps
 
 
+def strip_tap_key_sigs(data: bytes) -> bytes:
+    """Every byte of a psbt except its PSBT_IN_TAP_KEY_SIG records, found by walking the maps."""
+    stream = BytesIO(data)
+    out = bytearray(stream.read(5))
+    while stream.tell() < len(data):
+        start = stream.tell()
+        key_len = compact.read_from(stream)
+        if key_len:
+            key = stream.read(key_len)
+            stream.read(compact.read_from(stream))
+            if key == b"\x13":
+                continue
+        out += data[start:stream.tell()]
+    return bytes(out)
+
+
 def assert_only_signatures_added(before: bytes, after: bytes, num_inputs: int):
-    """`after` holds every key-value pair of `before`, unchanged, plus one 64-byte 0x13 per input."""
-    old, new = raw_maps(before), raw_maps(after)
-    assert len(old) == len(new)
-    for i, (a, b) in enumerate(zip(old, new)):
-        added = {k: v for k, v in b.items() if k not in a}
-        assert {k: b[k] for k in a} == a
-        if 1 <= i <= num_inputs:
-            assert list(added) == [b"\x13"] and len(added[b"\x13"]) == 64
-        else:
-            assert added == {}
+    """`after` is `before` byte for byte, with one 64-byte 0x13 added to each input map."""
+    assert after != before
+    assert strip_tap_key_sigs(after) == before
+    signatures = [m.get(b"\x13") for m in raw_maps(after)[1:1 + num_inputs]]
+    assert all(sig is not None and len(sig) == 64 for sig in signatures)
+    assert all(b"\x13" not in m for m in raw_maps(after)[1 + num_inputs:])
 
 
 def assert_signatures_verify(p: PSBT):
@@ -653,7 +677,7 @@ class TestSpendSigning:
     def test_kiss_bdk_fixtures_are_signed_losslessly(self, name, monkeypatch):
         monkeypatch.setattr(PSBT, "sign_with", MagicMock(side_effect=AssertionError("sign_with()")))
         raw = a2b_base64(SP_SPEND_PSBTS[name])
-        p = PSBT.parse(raw)
+        p = parse_kept(raw)
         parser = parse_testnet(p)
         assert parser.silent_payment_inputs == [True] * len(p.inputs)
         assert PSBTParser.sig_count(p) == 0
@@ -661,7 +685,7 @@ class TestSpendSigning:
         assert silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET) == len(p.inputs)
         assert PSBTParser.sig_count(p) == len(p.inputs)
         assert_signatures_verify(p)
-        assert_only_signatures_added(raw, p.serialize(), len(p.inputs))
+        assert_only_signatures_added(raw, silent_payments.psbt_bytes(p), len(p.inputs))
         assert p.version == 2
 
     def test_foreign_tweak_refused_before_signing(self):
@@ -675,7 +699,7 @@ class TestSpendSigning:
     @pytest.mark.parametrize("name", sorted(KISS_SPEND_VECTORS))
     def test_kiss_signer_vectors(self, name):
         b64, tweak_byte, outkey, sighash = KISS_SPEND_VECTORS[name]
-        p = PSBT.from_base64(b64)
+        p = parse_kept(a2b_base64(b64))
         parse_testnet(p)
         assert p.sighash(0, sighash=SIGHASH.DEFAULT).hex() == sighash
         key = silent_payments.spend_signing_key(abandon_seed(), TESTNET, p.inputs[0])
@@ -688,7 +712,7 @@ class TestSpendSigning:
         assert bip340_verify(bytes.fromhex(outkey), bytes.fromhex(sighash), p.inputs[0].unknown[b"\x13"])
 
     def test_kiss_signer_foreign_vector_refused(self):
-        assert_refused(PSBT.from_base64(KISS_SPEND_FOREIGN), RejectCode.FOREIGN_SILENT_PAYMENT)
+        assert_refused(parse_kept(a2b_base64(KISS_SPEND_FOREIGN)), RejectCode.FOREIGN_SILENT_PAYMENT)
 
     @pytest.mark.parametrize("backend", ["ctypes", "python"])
     def test_both_secp256k1_backends_sign_both_parities(self, backend):
@@ -702,7 +726,7 @@ class TestSpendSigning:
             import json, sys
             if sys.argv[1] == "python":
                 sys.modules["embit.util.ctypes_secp256k1"] = None  # makes the import fail
-            from binascii import a2b_base64
+            from binascii import a2b_base64, b2a_base64
             from embit.psbt import PSBT
             from embit.util import secp256k1
             from seedsigner.helpers import silent_payments
@@ -711,9 +735,11 @@ class TestSpendSigning:
             seed = Seed(["abandon"] * 11 + ["about"])
             out = {"backend": secp256k1.schnorrsig_sign.__module__, "signed": {}}
             for name, b64 in json.loads(sys.stdin.read()).items():
-                p = PSBT.parse(a2b_base64(b64))
+                raw = a2b_base64(b64)
+                p = PSBT.parse(raw)
+                silent_payments.remember_bytes(p, raw)
                 silent_payments.sign_spend_inputs(p, seed, SettingsConstants.TESTNET)
-                out["signed"][name] = p.to_base64()
+                out["signed"][name] = b2a_base64(silent_payments.psbt_bytes(p)).decode().strip()
             print(json.dumps(out))
         """)
         inputs = {name: SP_SPEND_PSBTS[name] for name in SIGNED_FIXTURES}
@@ -728,7 +754,9 @@ class TestSpendSigning:
         assert out["backend"] == expected[backend]
         parities = set()
         for name, b64 in out["signed"].items():
-            p = PSBT.from_base64(b64)
+            signed = a2b_base64(b64)
+            assert_only_signatures_added(a2b_base64(inputs[name]), signed, len(PSBT.parse(signed).inputs))
+            p = PSBT.parse(signed)
             assert_signatures_verify(p)
             for inp in p.inputs:
                 d = (b_spend() + int.from_bytes(inp.unknown[b"\x20"], "big")) % SECP_N
@@ -833,7 +861,7 @@ class TestSpendRefusals:
         assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="Sending to Silent Payment")
 
     def test_send_fields_refused_on_ordinary_psbt(self):
-        p = PSBT.from_base64(KISS_SPEND_VECTORS["even"][0])
+        p = parse_kept(a2b_base64(KISS_SPEND_VECTORS["even"][0]))
         for key in list(p.inputs[0].unknown):
             del p.inputs[0].unknown[key]
         p.outputs[0].unknown[b"\x09"] = b"\x01" * 66
@@ -849,26 +877,45 @@ class TestSpendRefusals:
         p.inputs[1].unknown.clear()
         assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="mixed")
 
-    def test_omitted_sequence_is_hashed_as_final_and_exported_explicitly(self):
+    def test_omitted_sequence_stays_omitted(self):
         """
-        BIP-370 reads an omitted PSBT_IN_SEQUENCE as 0xffffffff, and that is what embit
-        hashes. But embit fills the value in while parsing, so an omitted field can't be
-        told from an explicit one, and can't be refused: the export then carries it
-        explicitly. Pinned here as the one field the export doesn't return as it came.
+        BIP-370 reads an omitted PSBT_IN_SEQUENCE as 0xffffffff, which is exactly what
+        embit hashes -- but embit fills the value in while parsing, so a re-serialized
+        psbt would carry it explicitly and a coordinator would read that as a changed
+        transaction. Splicing into the psbt's own bytes leaves it absent.
         """
         p = sp_psbt("01-sp-spend-1in")
         p.inputs[0].sequence = None
         raw = p.serialize()
         assert b"\x10" not in raw_maps(raw)[1]
-        p = PSBT.parse(raw)
+        p = parse_kept(raw)
         assert p.inputs[0].sequence == 0xFFFFFFFF
         parse_testnet(p)
         silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
         assert_signatures_verify(p)
-        signed = raw_maps(p.serialize())[1]
-        assert signed.pop(b"\x10") == b"\xff" * 4
-        signed.pop(b"\x13")
-        assert signed == raw_maps(raw)[1]
+        signed = silent_payments.psbt_bytes(p)
+        assert b"\x10" not in raw_maps(signed)[1]
+        assert_only_signatures_added(raw, signed, 1)
+
+    def test_export_is_the_request_not_a_reserialization(self):
+        """embit reorders the fields it writes, so the response has to be the request's
+        own bytes: kiss-bdk compares what comes back against what it sent."""
+        p = sp_psbt("01-sp-spend-1in")
+        parse_testnet(p)
+        silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
+        signed = silent_payments.psbt_bytes(p)
+        assert strip_tap_key_sigs(signed) == a2b_base64(SP_SPEND_PSBTS["01-sp-spend-1in"])
+        assert signed != p.serialize()
+
+    def test_signing_without_the_original_bytes_is_refused(self):
+        p = PSBT.parse(a2b_base64(SP_SPEND_PSBTS["01-sp-spend-1in"]))
+        with pytest.raises(InvalidPSBTError) as e:
+            parse_testnet(p)
+        assert e.value.code == RejectCode.UNSUPPORTED_SILENT_PAYMENT
+        silent_payments.remember_bytes(p, p.serialize()[:-1])
+        with pytest.raises(ValueError):
+            silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
+        assert all(b"\x13" not in inp.unknown for inp in p.inputs)
 
     @pytest.mark.parametrize("change", [
         "sequence zero", "min time", "min height", "no tx version",
@@ -894,7 +941,7 @@ class TestSpendRefusals:
 
     @pytest.mark.parametrize("change", [
         "orphan spend key", "orphan tweak", "two spend keys", "short tweak", "long tweak",
-        "tweak key data", "ragged path", "no fingerprint", "invalid point", "short spend key",
+        "ragged path", "no fingerprint", "invalid point", "short spend key",
     ])
     def test_malformed_fields_refused(self, change):
         p = sp_psbt("01-sp-spend-1in")
@@ -910,8 +957,6 @@ class TestSpendRefusals:
             inp.unknown[b"\x20"] = bytes(31)
         elif change == "long tweak":
             inp.unknown[b"\x20"] += b"\x00"
-        elif change == "tweak key data":
-            inp.unknown[b"\x20\x00"] = inp.unknown.pop(b"\x20")
         elif change == "ragged path":
             inp.unknown[key] += b"\x00"
         elif change == "no fingerprint":
@@ -1060,3 +1105,106 @@ class TestSpendRefusals:
             [], DerivationPath(root.my_fingerprint, bip32.parse_path("m/86h/1h/0h/1/0")))
         assert_refused(p, RejectCode.UNREACHABLE_CHANGE_PATH)
 
+
+def spend_secrets() -> list[str]:
+    """b_spend, and d for every input of the fixtures, as hex."""
+    b = b_spend()
+    secrets = [b.to_bytes(32, "big").hex()]
+    for tweak in (0x01, 0x02, 0x77):
+        secrets.append(((b + int.from_bytes(bytes([tweak]) * 32, "big")) % SECP_N).to_bytes(32, "big").hex())
+    return secrets
+
+
+class TestSpendFlow(FlowTest):
+    def _scan(self, name):
+        def scan(view):
+            view.decoder.add_data(SP_SPEND_PSBTS[name])
+        return scan
+
+    @pytest.mark.parametrize("name", SIGNED_FIXTURES)
+    def test_scan_to_signed_qr(self, name, caplog, monkeypatch):
+        from seedsigner.models import encode_qr
+
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setattr(PSBT, "sign_with", MagicMock(side_effect=AssertionError("sign_with()")))
+        encoded = []
+        class RecordingEncoder(encode_qr.UrPsbtQrEncoder):
+            def __post_init__(self):
+                super().__post_init__()
+                # What the QR actually carries, which is the psbt's own bytes.
+                encoded.append(silent_payments.psbt_bytes(self.psbt))
+        monkeypatch.setattr(encode_qr, "UrPsbtQrEncoder", RecordingEncoder)
+
+        self.settings.set_value(SettingsConstants.SETTING__NETWORK, TESTNET)
+        self.controller.storage.seeds = [abandon_seed()]
+        seen = []
+        def record(view):
+            seen.append(repr(vars(view)))
+            seen.append(repr([(d.View_cls.__name__, d.view_args) for d in view.controller.back_stack]))
+
+        num_outputs = len(sp_psbt(name).outputs)
+        self.run_sequence([
+            FlowStep(MainMenuView, button_data_selection=MainMenuView.SCAN),
+            FlowStep(scan_views.ScanView, before_run=self._scan(name)),
+            FlowStep(psbt_views.PSBTSelectSeedView, before_run=record, screen_return_value=0),
+            FlowStep(psbt_views.PSBTOverviewView, before_run=record, screen_return_value=0),
+            FlowStep(psbt_views.PSBTNoChangeWarningView, before_run=record, screen_return_value=0),
+            FlowStep(psbt_views.PSBTMathView, before_run=record, screen_return_value=0),
+        ] + [
+            FlowStep(psbt_views.PSBTAddressDetailsView, before_run=record, screen_return_value=0)
+            for _ in range(num_outputs)
+        ] + [
+            FlowStep(psbt_views.PSBTFinalizeView, before_run=record, button_data_selection=psbt_views.PSBTFinalizeView.APPROVE_PSBT),
+            FlowStep(psbt_views.PSBTSignedQRDisplayView, before_run=record, screen_return_value=0),
+            FlowStep(MainMenuView),
+        ])
+        seen.append(repr([(d.View_cls.__name__, d.view_args) for d in self.controller.back_stack]))
+
+        assert len(encoded) == 1
+        signed = PSBT.parse(encoded[0])
+        assert_signatures_verify(signed)
+        assert_only_signatures_added(a2b_base64(SP_SPEND_PSBTS[name]), encoded[0], len(signed.inputs))
+
+        logs = [r.getMessage() for r in caplog.records]
+        assert any("signatures added" in line for line in logs)
+        for secret in spend_secrets():
+            assert not [line for line in logs if secret in line]
+            assert not [entry for entry in seen if secret in entry]
+
+    def test_foreign_tweak_refused_in_the_flow(self, monkeypatch):
+        monkeypatch.setattr(silent_payments, "sign_spend_inputs", MagicMock(side_effect=AssertionError("signed")))
+        self.settings.set_value(SettingsConstants.SETTING__NETWORK, TESTNET)
+        self.controller.storage.seeds = [abandon_seed()]
+
+        def assert_code(view):
+            assert view.code == RejectCode.FOREIGN_SILENT_PAYMENT
+
+        self.run_sequence([
+            FlowStep(MainMenuView, button_data_selection=MainMenuView.SCAN),
+            FlowStep(scan_views.ScanView, before_run=self._scan("04-sp-spend-foreign-tweak")),
+            FlowStep(psbt_views.PSBTSelectSeedView, screen_return_value=0),
+            FlowStep(psbt_views.PSBTOverviewView, is_redirect=True),
+            FlowStep(psbt_views.PSBTRefusalView, before_run=assert_code, screen_return_value=0),
+            FlowStep(MainMenuView),
+        ])
+        assert self.controller.psbt is None
+
+    @pytest.mark.parametrize("card", ["SATOCHIP", "KEYCARD"])
+    def test_card_refused_before_connecting(self, card, monkeypatch):
+        from seedsigner.helpers import seedkeeper_utils
+        monkeypatch.setattr(seedkeeper_utils, "init_satochip", MagicMock(side_effect=AssertionError("card connected")))
+        self.settings.set_value(SettingsConstants.SETTING__NETWORK, TESTNET)
+        self.settings.set_value(SettingsConstants.SETTING__SATOCHIP_SUPPORT, SettingsConstants.OPTION__ENABLED)
+        self.settings.set_value(SettingsConstants.SETTING__KEYCARD_SUPPORT, SettingsConstants.OPTION__ENABLED)
+        self.controller.storage.seeds = [abandon_seed()]
+
+        def assert_code(view):
+            assert view.code == RejectCode.UNSUPPORTED_SILENT_PAYMENT
+
+        self.run_sequence([
+            FlowStep(MainMenuView, button_data_selection=MainMenuView.SCAN),
+            FlowStep(scan_views.ScanView, before_run=self._scan("01-sp-spend-1in")),
+            FlowStep(psbt_views.PSBTSelectSeedView, button_data_selection=getattr(psbt_views.PSBTSelectSeedView, card)),
+            FlowStep(psbt_views.PSBTRefusalView, before_run=assert_code, screen_return_value=0),
+            FlowStep(MainMenuView),
+        ])

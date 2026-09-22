@@ -8,6 +8,7 @@ from embit import bip32
 import logging
 import time
 
+from seedsigner.helpers import silent_payments
 from seedsigner.models.psbt_parser import InvalidPSBTError, PSBTParser, RejectCode, RiskWarning
 from seedsigner.models.settings import SettingsConstants
 from seedsigner.gui.components import FontAwesomeIconConstants, GUIConstants, SeedSignerIconConstants
@@ -170,6 +171,17 @@ class PSBTSelectSeedView(View):
             return Destination(ScanBIP38QRView)
 
         elif button_data[selected_menu_num] in [self.SATOCHIP, self.KEYCARD]:
+            selected_psbt = self.controller.psbt
+            if silent_payments.has_send_fields(selected_psbt) or any(
+                silent_payments.is_spend_input(inp) for inp in selected_psbt.inputs
+            ):
+                # Before connecting: card selection below reads a BIP-32 derivation
+                # these inputs don't have, and no card holds a Silent Payment spend key.
+                return refusal_destination(InvalidPSBTError(
+                    "Smartcards can't sign Silent Payment transactions.",
+                    code=RejectCode.UNSUPPORTED_SILENT_PAYMENT,
+                ))
+
             from seedsigner.helpers import seedkeeper_utils
             from embit.bip32 import HDKey
 
@@ -572,6 +584,14 @@ REJECT_PRESENTATION = {
         clear_psbt=False,
         clear_history=False,
         destination_name="PSBTSelectSeedView",
+    ),
+
+    RejectCode.FOREIGN_SILENT_PAYMENT: RejectPresentation(
+        screen=WarningScreen,
+        title=_mft("Transaction Problem"),
+        # TRANSLATOR_NOTE: A Silent Payment input's tweak or key doesn't prove it belongs to this seed
+        text=_mft("This Silent Payment input isn't this wallet's."),
+        button_label=_mft("Discard transaction"),
     ),
 }
 
@@ -1393,6 +1413,8 @@ class PSBTFinalizeView(View):
             return Destination(BackStackView)
 
         sig_cnt = PSBTParser.sig_count(psbt)
+        # BIP-376: every input is a Silent Payment spend the parser proved this seed's.
+        is_silent_payment = psbt_parser is not None and any(psbt_parser.silent_payment_inputs)
         logger.info(
             "PSBTFinalize: approve selected; signer_mode=%s initial_sig_count=%d inputs=%d",
             "card" if self.controller.psbt_sign_with_satochip else "seed",
@@ -1434,6 +1456,13 @@ class PSBTFinalizeView(View):
                     "PSBTFinalize: card signer reported signed=%d timed_out=%s",
                     added, sign_result.timed_out,
                 )
+            elif is_silent_payment:
+                # Never sign_with(), which walks every input. This signs all inputs or
+                # none, and adds only their PSBT_IN_TAP_KEY_SIG.
+                try:
+                    silent_payments.sign_spend_inputs(psbt, psbt_parser.seed, psbt_parser.network)
+                except ValueError as e:
+                    logger.info("PSBTFinalize: Silent Payment signing refused: %s", e)
             else:
                 psbt.sign_with(psbt_parser.root)
             if isinstance(self.controller.psbt_seed, WIFKey):
@@ -1447,7 +1476,9 @@ class PSBTFinalizeView(View):
             else:
                 self.controller.signed_tx_hex = None
 
-            trimmed_psbt = PSBTParser.trim(psbt)
+            # trim() rebuilds a v0 psbt without the unknown fields a signed Silent
+            # Payment spend is, so that goes back as it came, 0x13 added.
+            trimmed_psbt = psbt if is_silent_payment else PSBTParser.trim(psbt)
             trimmed_sig_cnt = PSBTParser.sig_count(trimmed_psbt)
             logger.info(
                 "PSBTFinalize: post-sign trimmed_sig_count=%d delta=%d",
@@ -1532,7 +1563,7 @@ class PSBTSignedQRDisplayView(View):
             signed_path = save_path.with_name(save_path.name + ".signed")
             try:
                 signed_path.parent.mkdir(parents=True, exist_ok=True)
-                signed_path.write_bytes(self.controller.psbt.serialize())
+                signed_path.write_bytes(silent_payments.psbt_bytes(self.controller.psbt))
                 try:
                     display_path = str(signed_path.relative_to(MicroSD.get_microsd_dir()))
                 except ValueError:

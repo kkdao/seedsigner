@@ -202,6 +202,7 @@ class TestSyntheticRefusalMessagesFit:
         "Input 999 carries signature or script data.",
         "Input 999 carries a field of its own.",
         "This PSBT carries a global field of its own.",
+        "Silent Payment spends need the PSBT as received.",
         "This transaction can still be changed after you sign.",
         "This signer can't sign Silent Payment inputs.",
         "Smartcards can't sign Silent Payment transactions.",
