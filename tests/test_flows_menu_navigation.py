@@ -1372,11 +1372,13 @@ class TestMenuNavigationFlows(FlowTest):
         ]
 
     def test_seed_options_silent_payments(self):
-        """Seed options → Silent Payments → notice → Private Scan Key → details → QR →
-        Next in Sparrow → back to Seed options, with the flow gone from the back stack."""
+        """Seed options → Silent Payments → notice → Export scan key → Private Scan Key →
+        details → QR → Next in Sparrow → back to Seed options, with the flow gone from
+        the back stack."""
         self.run_sequence(self._open_seed_options() + [
             FlowStep(seed_views.SeedOptionsView, button_data_selection=seed_views.SeedOptionsView.SILENT_PAYMENTS),
             FlowStep(seed_views.SeedSilentPaymentsNoticeView, screen_return_value=0),
+            FlowStep(seed_views.SeedSilentPaymentsMenuView, button_data_selection=seed_views.SeedSilentPaymentsMenuView.EXPORT_SCAN_KEY),
             FlowStep(seed_views.SeedSilentPaymentsWarningView, screen_return_value=0),
             FlowStep(seed_views.SeedSilentPaymentsDetailsView, screen_return_value=0),
             FlowStep(seed_views.SeedSilentPaymentsScanKeyQRView),
@@ -1386,19 +1388,38 @@ class TestMenuNavigationFlows(FlowTest):
         assert [d.View_cls for d in self.controller.back_stack][-2:] == [seed_views.SeedsMenuView, seed_views.SeedOptionsView]
 
     def test_seed_options_silent_payments_back(self):
-        """BACK from the notice, the warning or the details returns to Seed options."""
+        """BACK from the notice or the menu returns to Seed options; BACK from the warning
+        or the details returns to the Silent Payments menu."""
         SILENT_PAYMENTS = seed_views.SeedOptionsView.SILENT_PAYMENTS
+        EXPORT_SCAN_KEY = seed_views.SeedSilentPaymentsMenuView.EXPORT_SCAN_KEY
         self.run_sequence(self._open_seed_options() + [
             FlowStep(seed_views.SeedOptionsView, button_data_selection=SILENT_PAYMENTS),
             FlowStep(seed_views.SeedSilentPaymentsNoticeView, screen_return_value=RET_CODE__BACK_BUTTON),
             FlowStep(seed_views.SeedOptionsView, button_data_selection=SILENT_PAYMENTS),
             FlowStep(seed_views.SeedSilentPaymentsNoticeView, screen_return_value=0),
+            FlowStep(seed_views.SeedSilentPaymentsMenuView, button_data_selection=EXPORT_SCAN_KEY),
             FlowStep(seed_views.SeedSilentPaymentsWarningView, screen_return_value=RET_CODE__BACK_BUTTON),
-            FlowStep(seed_views.SeedOptionsView, button_data_selection=SILENT_PAYMENTS),
-            FlowStep(seed_views.SeedSilentPaymentsNoticeView, screen_return_value=0),
+            FlowStep(seed_views.SeedSilentPaymentsMenuView, button_data_selection=EXPORT_SCAN_KEY),
             FlowStep(seed_views.SeedSilentPaymentsWarningView, screen_return_value=0),
             FlowStep(seed_views.SeedSilentPaymentsDetailsView, screen_return_value=RET_CODE__BACK_BUTTON),
+            FlowStep(seed_views.SeedSilentPaymentsMenuView, screen_return_value=RET_CODE__BACK_BUTTON),
             FlowStep(seed_views.SeedOptionsView),
+        ])
+
+    def test_seed_options_silent_payments_address(self):
+        """Show address → share check → address details → address QR → back to the menu.
+        "Export scan key first" on the share check goes into the scan-key flow."""
+        SHOW_ADDRESS = seed_views.SeedSilentPaymentsMenuView.SHOW_ADDRESS
+        self.run_sequence(self._open_seed_options() + [
+            FlowStep(seed_views.SeedOptionsView, button_data_selection=seed_views.SeedOptionsView.SILENT_PAYMENTS),
+            FlowStep(seed_views.SeedSilentPaymentsNoticeView, screen_return_value=0),
+            FlowStep(seed_views.SeedSilentPaymentsMenuView, button_data_selection=SHOW_ADDRESS),
+            FlowStep(seed_views.SeedSilentPaymentsShareCheckView, button_data_selection=seed_views.SeedSilentPaymentsShareCheckView.SHOW_ADDRESS),
+            FlowStep(seed_views.SeedSilentPaymentsAddressView, screen_return_value=0),
+            FlowStep(seed_views.SeedSilentPaymentsAddressQRView),
+            FlowStep(seed_views.SeedSilentPaymentsMenuView, button_data_selection=SHOW_ADDRESS),
+            FlowStep(seed_views.SeedSilentPaymentsShareCheckView, button_data_selection=seed_views.SeedSilentPaymentsShareCheckView.EXPORT_FIRST),
+            FlowStep(seed_views.SeedSilentPaymentsWarningView),
         ])
 
 

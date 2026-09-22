@@ -41,6 +41,7 @@ ABANDON = ["abandon"] * 11 + ["about"]
 # abandon...about, account 0, cross-checked against kiss-signer and Sparrow.
 ABANDON_MAINNET_ADDRESS = "sp1qqfqnnv8czppwysafq3uwgwvsc638hc8rx3hscuddh0xa2yd746s7xqh6yy9ncjnqhqxazct0fzh98w7lpkm5fvlepqec2yy0sxlq4j6ccc3h6t0g"
 ABANDON_MAINNET_EXPORT = "[73c5da0a/352h/0h/0h]spscan1q0rnl6lft0gkpg4nsn528qgdpytfdej40atdqgrxpqqsg8c5r8vys973ppv7y5c9cphgkzm6g4efmhhcdkazt87ggxwz3pruphc9vkkxxhtvyag"
+ABANDON_TESTNET_ADDRESS = "tsp1qqdpels3srq45dlezqvk20t3dlueftry6p5thc7msjm0s6jm3g84jzq5rxzzunfck6d45va2jcqxk429agt3e4klf3vzmcgp3zqthryhhqgnz4k3n"
 
 
 # BIP-352 send_and_receive_test_vectors.json: (scan priv, spend priv, unlabeled address)
@@ -370,6 +371,7 @@ class TestScanKeyStaysInTheQRView(FlowTest):
         self.run_sequence([
             FlowStep(seed_views.SeedOptionsView, before_run=record, button_data_selection=seed_views.SeedOptionsView.SILENT_PAYMENTS),
             FlowStep(seed_views.SeedSilentPaymentsNoticeView, before_run=record, screen_return_value=0),
+            FlowStep(seed_views.SeedSilentPaymentsMenuView, before_run=record, button_data_selection=seed_views.SeedSilentPaymentsMenuView.EXPORT_SCAN_KEY),
             FlowStep(seed_views.SeedSilentPaymentsWarningView, before_run=record, screen_return_value=0),
             FlowStep(seed_views.SeedSilentPaymentsDetailsView, before_run=record, screen_return_value=0),
             FlowStep(seed_views.SeedSilentPaymentsScanKeyQRView, before_run=qr_views.append),
@@ -400,6 +402,85 @@ class TestScanKeyQRBlocksTheScreensaver(FlowTest):
         ], initial_destination_view_args=dict(seed=abandon_seed()))
 
         assert self.controller.is_screensaver_start_allowed is False
+
+
+
+class TestAddressRoute(FlowTest):
+    def _capture_screen(self, captured):
+        """A before_run hook that records the kwargs the View hands its Screen."""
+        def hook(view):
+            mocked = view.run_screen
+            def run_screen(screen_cls, **kwargs):
+                captured.append((screen_cls, kwargs))
+                return mocked(screen_cls, **kwargs)
+            view.run_screen = run_screen
+        return hook
+
+    def test_share_check_is_always_shown_and_focuses_export_first(self):
+        # The share check is about losing payments, not privacy, so the privacy-warnings
+        # setting doesn't skip it. Its first button, the default focus, is the export.
+        self.settings.set_value(SettingsConstants.SETTING__PRIVACY_WARNINGS, SettingsConstants.OPTION__DISABLED)
+        captured = []
+        self.run_sequence([
+            FlowStep(seed_views.SeedSilentPaymentsMenuView, button_data_selection=seed_views.SeedSilentPaymentsMenuView.SHOW_ADDRESS),
+            FlowStep(seed_views.SeedSilentPaymentsShareCheckView, before_run=self._capture_screen(captured), screen_return_value=0),
+            FlowStep(seed_views.SeedSilentPaymentsWarningView),
+        ], initial_destination_view_args=dict(seed=abandon_seed()))
+        _, kwargs = captured[0]
+        assert kwargs["button_data"][0] == seed_views.SeedSilentPaymentsShareCheckView.EXPORT_FIRST
+        assert kwargs["text"] == "Share only after Sparrow has the scan key and a birth date before your first payment."
+
+    @pytest.mark.parametrize("network, display, address", [
+        (SettingsConstants.MAINNET, "Mainnet", ABANDON_MAINNET_ADDRESS),
+        (SettingsConstants.TESTNET, "Testnet", ABANDON_TESTNET_ADDRESS),
+    ])
+    def test_address_details_show_network_and_address(self, network, display, address):
+        self.settings.set_value(SettingsConstants.SETTING__NETWORK, network)
+        captured = []
+        self.run_sequence([
+            FlowStep(seed_views.SeedSilentPaymentsAddressView, before_run=self._capture_screen(captured), screen_return_value=0),
+            FlowStep(seed_views.SeedSilentPaymentsAddressQRView),
+        ], initial_destination_view_args=dict(seed=abandon_seed()))
+        _, kwargs = captured[0]
+        assert kwargs["network"] == display
+        assert kwargs["address"] == address
+        assert kwargs["fingerprint"] == "73c5da0a"
+
+    def test_address_route_never_touches_the_scan_key(self, caplog, monkeypatch):
+        from seedsigner.models import encode_qr
+
+        caplog.set_level(logging.DEBUG)
+        def no_scan_key(*args, **kwargs):
+            raise AssertionError("the address route derived the scan-key export")
+        monkeypatch.setattr(silent_payments, "scan_key_export", no_scan_key)
+
+        drawn = []
+        class RecordingEncoder(encode_qr.GenericStaticQrEncoder):
+            def __post_init__(self):
+                super().__post_init__()
+                drawn.append(self.data)
+        monkeypatch.setattr(encode_qr, "GenericStaticQrEncoder", RecordingEncoder)
+
+        seen = []
+        def record(view):
+            seen.append(repr(vars(view)))
+            seen.append(repr([(d.View_cls.__name__, d.view_args) for d in view.controller.back_stack]))
+
+        self.run_sequence([
+            FlowStep(seed_views.SeedSilentPaymentsMenuView, before_run=record, button_data_selection=seed_views.SeedSilentPaymentsMenuView.SHOW_ADDRESS),
+            FlowStep(seed_views.SeedSilentPaymentsShareCheckView, before_run=record, button_data_selection=seed_views.SeedSilentPaymentsShareCheckView.SHOW_ADDRESS),
+            FlowStep(seed_views.SeedSilentPaymentsAddressView, before_run=record, screen_return_value=0),
+            FlowStep(seed_views.SeedSilentPaymentsAddressQRView, before_run=record),
+            FlowStep(seed_views.SeedSilentPaymentsMenuView),
+        ], initial_destination_view_args=dict(seed=abandon_seed()))
+
+        assert drawn == [ABANDON_MAINNET_ADDRESS]
+        root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(" ".join(ABANDON)))
+        secrets = [ABANDON_MAINNET_EXPORT, key_part(ABANDON_MAINNET_EXPORT), root.derive("m/352h/0h/0h/1h/0").key.secret.hex()]
+        logs = [r.getMessage() for r in caplog.records]
+        for secret in secrets:
+            assert not [line for line in logs if secret in line]
+            assert not [entry for entry in seen if secret in entry]
 
 
 

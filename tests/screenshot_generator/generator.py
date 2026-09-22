@@ -502,6 +502,9 @@ def generate_screenshots(locale):
                 ScreenshotConfig(seed_views.SeedBIP85SelectChildIndexView,   dict(seed=seed_12, num_words=24)),
                 ScreenshotConfig(seed_views.SeedBIP85InvalidChildIndexView,  dict(seed=seed_12, num_words=12)), 
                 ScreenshotConfig(seed_views.SeedSilentPaymentsNoticeView,    dict(seed=seed_12)),
+                ScreenshotConfig(seed_views.SeedSilentPaymentsMenuView,      dict(seed=seed_12)),
+                ScreenshotConfig(seed_views.SeedSilentPaymentsShareCheckView, dict(seed=seed_12)),
+                ScreenshotConfig(seed_views.SeedSilentPaymentsAddressView,   dict(seed=seed_12)),
                 ScreenshotConfig(seed_views.SeedSilentPaymentsWarningView,   dict(seed=seed_12)),
                 ScreenshotConfig(seed_views.SeedSilentPaymentsDetailsView,   dict(seed=seed_12)),
                 # No SeedSilentPaymentsScanKeyQRView: a thread draws its QR after the first frame, the one captured here.

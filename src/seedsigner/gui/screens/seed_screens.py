@@ -711,6 +711,42 @@ class SeedSilentPaymentsDetailsScreen(ButtonListScreen):
 
 
 @dataclass
+class SeedSilentPaymentsAddressScreen(ButtonListScreen):
+    """
+    The seed's public Silent Payment address, with its network, fingerprint and path,
+    and its start and checksum tail highlighted for checking against the wallet.
+    """
+    is_bottom_list: bool = True
+    network: str = None
+    fingerprint: str = None
+    derivation_path: str = "m/352'/0'/0'"
+    address: str = "sp1q..."
+
+    def __post_init__(self):
+        self.button_data = [ButtonOption("Show QR")]
+        # TRANSLATOR_NOTE: Title of the screen showing the seed's Silent Payment address
+        self.title = _("SP Address")
+        super().__post_init__()
+
+        screen_y = self.top_nav.height + GUIConstants.COMPONENT_PADDING
+        for icon_name, value in (
+                (SeedSignerIconConstants.BITCOIN_ALT, f"{self.network}  {self.fingerprint}"),
+                (SeedSignerIconConstants.DERIVATION, self.derivation_path)):
+            line = IconTextLine(icon_name=icon_name, icon_color=GUIConstants.INFO_COLOR, value_text=value,
+                                screen_x=GUIConstants.COMPONENT_PADDING, screen_y=screen_y)
+            self.components.append(line)
+            screen_y += line.height + GUIConstants.COMPONENT_PADDING
+
+        self.components.append(FormattedAddress(
+            address=self.address,
+            max_lines=3,
+            font_size=GUIConstants.get_body_font_size() + 2,
+            screen_y=screen_y + GUIConstants.COMPONENT_PADDING,
+        ))
+
+
+
+@dataclass
 class SeedAddPassphraseScreen(BaseTopNavScreen):
     passphrase: str = ""
 

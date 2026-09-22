@@ -2934,7 +2934,118 @@ class SeedSilentPaymentsNoticeView(View):
         if selected_menu_num == RET_CODE__BACK_BUTTON:
             return Destination(BackStackView)
 
-        return Destination(SeedSilentPaymentsWarningView, view_args=dict(seed=self.seed), skip_current_view=True)
+        return Destination(SeedSilentPaymentsMenuView, view_args=dict(seed=self.seed), skip_current_view=True)
+
+
+
+class SeedSilentPaymentsMenuView(View):
+    EXPORT_SCAN_KEY = ButtonOption("Export scan key")
+    SHOW_ADDRESS = ButtonOption("Show address")
+
+    def __init__(self, seed: Seed):
+        super().__init__()
+        self.seed = seed
+
+
+    def run(self):
+        button_data = [self.EXPORT_SCAN_KEY, self.SHOW_ADDRESS]
+        selected_menu_num = self.run_screen(
+            ButtonListScreen,
+            title=_("Silent Payments"),
+            button_data=button_data,
+            is_bottom_list=True,
+        )
+
+        if selected_menu_num == RET_CODE__BACK_BUTTON:
+            return Destination(BackStackView)
+
+        if button_data[selected_menu_num] == self.EXPORT_SCAN_KEY:
+            return Destination(SeedSilentPaymentsWarningView, view_args=dict(seed=self.seed))
+
+        return Destination(SeedSilentPaymentsShareCheckView, view_args=dict(seed=self.seed))
+
+
+
+class SeedSilentPaymentsShareCheckView(View):
+    """
+    Asks, before the address is shown, that the wallet watching it is set up. The
+    device can't check that itself, and a payment sent before the watching wallet's
+    birth date is one that wallet never finds.
+    """
+    EXPORT_FIRST = ButtonOption("Export scan key first")
+    SHOW_ADDRESS = ButtonOption("Show address")
+
+    def __init__(self, seed: Seed):
+        super().__init__()
+        self.seed = seed
+
+
+    def run(self):
+        # Always shown: this is about missed payments, not privacy, so the
+        # privacy-warnings setting doesn't skip it. The export is the default focus.
+        button_data = [self.EXPORT_FIRST, self.SHOW_ADDRESS]
+        selected_menu_num = self.run_screen(
+            WarningScreen,
+            # TRANSLATOR_NOTE: Title of the reminder shown before a Silent Payment address
+            title=_("Before You Share"),
+            status_icon_size=0,
+            status_headline=None,
+            text=_("Share only after Sparrow has the scan key and a birth date before your first payment."),
+            button_data=button_data,
+        )
+
+        if selected_menu_num == RET_CODE__BACK_BUTTON:
+            return Destination(BackStackView)
+
+        if button_data[selected_menu_num] == self.EXPORT_FIRST:
+            return Destination(SeedSilentPaymentsWarningView, view_args=dict(seed=self.seed), skip_current_view=True)
+
+        return Destination(SeedSilentPaymentsAddressView, view_args=dict(seed=self.seed), skip_current_view=True)
+
+
+
+class SeedSilentPaymentsAddressView(View):
+    """The public address. Nothing on this route derives or holds the private scan key."""
+    def __init__(self, seed: Seed):
+        super().__init__()
+        self.seed = seed
+
+
+    def run(self):
+        from seedsigner.helpers import silent_payments
+        network = self.settings.get_value(SettingsConstants.SETTING__NETWORK)
+
+        selected_menu_num = self.run_screen(
+            seed_screens.SeedSilentPaymentsAddressScreen,
+            network=_(self.settings.get_value_display_name(SettingsConstants.SETTING__NETWORK)),
+            fingerprint=self.seed.get_fingerprint(network),
+            derivation_path=silent_payments.derivation_path(network),
+            address=silent_payments.address(self.seed, network),
+        )
+
+        if selected_menu_num == RET_CODE__BACK_BUTTON:
+            return Destination(BackStackView)
+
+        return Destination(SeedSilentPaymentsAddressQRView, view_args=dict(seed=self.seed))
+
+
+
+class SeedSilentPaymentsAddressQRView(View):
+    def __init__(self, seed: Seed):
+        super().__init__()
+        self.seed = seed
+
+
+    def run(self):
+        from seedsigner.gui.screens.screen import QRDisplayScreen
+        from seedsigner.helpers import silent_payments
+        from seedsigner.models.encode_qr import GenericStaticQrEncoder
+
+        # The address is public, so the normal QR path is fine here.
+        address = silent_payments.address(self.seed, self.settings.get_value(SettingsConstants.SETTING__NETWORK))
+        self.run_screen(QRDisplayScreen, qr_encoder=GenericStaticQrEncoder(data=address))
+
+        return Destination(SeedSilentPaymentsMenuView, view_args=dict(seed=self.seed), skip_current_view=True)
 
 
 
