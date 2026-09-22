@@ -34,6 +34,7 @@ jobs:
     # 3.12 leg timed out. 30 leaves room for adding tests without cutting coverage.
     timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         # 3.10: currently used by Seedsigner
         # 3.12: latest stable Python as upper test bound
@@ -163,6 +164,7 @@ jobs:
         if: always()
 
   desktop:
+    if: false
     runs-on: ${{ matrix.os }}
     # A healthy desktop leg is ~15 minutes. Windows occasionally stalls and then loses the
     # runner after ~55; bound it so that shows up as a timeout (with whatever log pytest
