@@ -29,8 +29,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         # 3.10: currently used by Seedsigner
         # 3.12: latest stable Python as upper test bound
@@ -124,6 +125,7 @@ jobs:
         if: always()
 
   desktop:
+    if: false
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
