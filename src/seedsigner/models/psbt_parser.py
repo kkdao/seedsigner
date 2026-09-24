@@ -1505,6 +1505,11 @@ class PSBTParser():
         # over the course of the loop below, so grab them once now.
         vout = self.psbt.tx.vout
 
+        # A Silent Payment output is sorted by its code, not by a derivation path: the
+        # coordinator cannot annotate one, and the script this device just computed is
+        # the proof. Shown as the sp1... address the user was given, as BIP-375 asks.
+        silent_payment_outputs = {r["index"]: r for r in self.silent_payment_recipients}
+
         for i, out in enumerate(self.psbt.outputs):
             value = vout[i].value
             if not 0 <= value <= MAX_MONEY:
@@ -1512,6 +1517,23 @@ class PSBTParser():
                     f"Output {i} amount out of range: {value}",
                     code=RejectCode.AMOUNT_OUT_OF_RANGE,
                 )
+
+            recipient = silent_payment_outputs.get(i)
+            if recipient is not None:
+                if recipient["change"]:
+                    self.change_data.append({
+                        "output_index": i,
+                        "address": recipient["address"],
+                        "amount": value,
+                        "verified_derivation_path": None,
+                        "silent_payment": True,
+                    })
+                    self.change_amount += value
+                else:
+                    self.destination_addresses.append(recipient["address"])
+                    self.destination_amounts.append(value)
+                    self.spend_amount += value
+                continue
             out_policy = PSBTParser._get_policy(out, vout[i].script_pubkey, self.psbt.xpubs, child_key_derivation_cache)
             is_presumed_change = False
 

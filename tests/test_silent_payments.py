@@ -21,7 +21,7 @@ import sys
 import tempfile
 import textwrap
 import time
-from binascii import a2b_base64
+from binascii import a2b_base64, b2a_base64
 from io import BytesIO
 from unittest.mock import MagicMock
 
@@ -2170,6 +2170,145 @@ def send_secrets(kind: str, raw: bytes) -> list:
     return secrets
 
 
+class TestSendFlow(FlowTest):
+    """The whole flow a user goes through, from the scanned request to the response."""
+
+    def _scan(self, raw: bytes):
+        def scan(view):
+            view.decoder.add_data(b2a_base64(raw, newline=False).decode())
+        return scan
+
+    def _run(self, raw: bytes, outputs: int, change: int = 0, record=None,
+             save_path=None) -> list:
+        self.settings.set_value(SettingsConstants.SETTING__NETWORK, TESTNET)
+        self.controller.storage.seeds = [abandon_seed()]
+
+        def at_finalize(view):
+            # A scanned psbt clears the save path, so the card's own path is set here,
+            # where the microSD flow would have it by the time the response is written.
+            if save_path is not None:
+                view.controller.psbt_microsd_save_path = save_path
+            if record:
+                record(view)
+
+        steps = [
+            FlowStep(MainMenuView, button_data_selection=MainMenuView.SCAN),
+            FlowStep(scan_views.ScanView, before_run=self._scan(raw)),
+            FlowStep(psbt_views.PSBTSelectSeedView, before_run=record, screen_return_value=0),
+            FlowStep(psbt_views.PSBTOverviewView, before_run=record, screen_return_value=0),
+        ]
+        if not change:
+            steps.append(FlowStep(psbt_views.PSBTNoChangeWarningView, before_run=record,
+                                  screen_return_value=0))
+        steps.append(FlowStep(psbt_views.PSBTMathView, before_run=record, screen_return_value=0))
+        steps += [FlowStep(psbt_views.PSBTAddressDetailsView, before_run=record,
+                           screen_return_value=0) for _ in range(outputs)]
+        steps += [FlowStep(psbt_views.PSBTChangeDetailsView, before_run=record,
+                           screen_return_value=0) for _ in range(change)]
+        steps += [
+            FlowStep(psbt_views.PSBTFinalizeView, before_run=at_finalize,
+                     button_data_selection=psbt_views.PSBTFinalizeView.APPROVE_PSBT),
+            FlowStep(psbt_views.PSBTSignedQRDisplayView, before_run=record, screen_return_value=0),
+            FlowStep(MainMenuView),
+        ]
+        return self.run_sequence(steps)
+
+    @pytest.mark.parametrize("kind", ["p2tr", "p2wpkh"])
+    def test_scan_to_signed_qr(self, kind, caplog, monkeypatch):
+        from seedsigner.models import encode_qr
+
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setattr(PSBT, "sign_with", MagicMock(side_effect=AssertionError("sign_with()")))
+        encoded = []
+
+        class RecordingEncoder(encode_qr.UrPsbtQrEncoder):
+            def __post_init__(self):
+                super().__post_init__()
+                encoded.append(silent_payments.psbt_bytes(self.psbt))
+
+        monkeypatch.setattr(encode_qr, "UrPsbtQrEncoder", RecordingEncoder)
+        seen = []
+
+        def record(view):
+            seen.append(repr(vars(view)))
+            seen.append(repr([(d.View_cls.__name__, d.view_args) for d in view.controller.back_stack]))
+
+        raw = send_request(kind, [sp_keys(stranger_seed()) + (None,)])
+        self._run(raw, outputs=1, record=record)
+
+        assert len(encoded) == 1
+        assert undo_send_changes(encoded[0], raw) == raw
+        signed = PSBT.parse(encoded[0])
+        assert PSBTParser.sig_count(signed) == 1
+        assert signed.outputs[0].script_pubkey.data == expected_send_scripts(raw)[0]
+
+        logs = [r.getMessage() for r in caplog.records]
+        assert any("signatures added" in line for line in logs)
+        for secret in send_secrets(kind, raw):
+            assert not [line for line in logs if secret in line]
+            assert not [entry for entry in seen if secret in entry]
+
+    @pytest.mark.parametrize("kind", ["p2tr", "p2wpkh"])
+    def test_scan_to_signed_microsd_file(self, kind, tmp_path):
+        raw = send_request(kind, [sp_keys(stranger_seed()) + (None,)])
+        save_path = tmp_path / "psbt" / "unsigned.psbt"
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_bytes(raw)
+
+        self._run(raw, outputs=1, save_path=save_path)
+
+        written = (tmp_path / "psbt" / "unsigned.psbt.signed").read_bytes()
+        assert undo_send_changes(written, raw) == raw
+        assert PSBTParser.sig_count(PSBT.parse(written)) == 1
+
+    def test_the_recipient_is_shown_as_a_silent_payment_address(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        shown = []
+
+        def record(view):
+            parser = view.controller.psbt_parser
+            if parser:
+                shown.append(list(parser.destination_addresses))
+
+        self._run(raw, outputs=1, record=record)
+        address = silent_payments._bech32m("tsp", b"".join(sp_keys(stranger_seed())))
+        assert all(addresses == [address] for addresses in shown if addresses)
+
+    def test_change_back_to_our_own_address_is_shown_as_change(self):
+        scan, spend = change_code()
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,), (scan, spend, 0)])
+        titles = []
+
+        def record(view):
+            parser = view.controller.psbt_parser
+            if parser and parser.change_data:
+                titles.append(parser.change_data[0])
+
+        self._run(raw, outputs=1, change=1, record=record)
+        assert titles and titles[0]["address"] == silent_payments._bech32m("tsp", scan + spend)
+        assert titles[0]["silent_payment"] is True
+
+    def test_an_input_of_another_wallet_is_refused_in_the_flow(self, monkeypatch):
+        monkeypatch.setattr(silent_payments, "sign_send_inputs",
+                            MagicMock(side_effect=AssertionError("signed")))
+        self.settings.set_value(SettingsConstants.SETTING__NETWORK, TESTNET)
+        self.controller.storage.seeds = [abandon_seed()]
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)], seed=stranger_seed())
+
+        def assert_code(view):
+            assert view.code == RejectCode.FOREIGN_SILENT_PAYMENT
+
+        self.run_sequence([
+            FlowStep(MainMenuView, button_data_selection=MainMenuView.SCAN),
+            FlowStep(scan_views.ScanView, before_run=self._scan(raw)),
+            FlowStep(psbt_views.PSBTSelectSeedView, screen_return_value=0),
+            FlowStep(psbt_views.PSBTOverviewView, is_redirect=True),
+            FlowStep(psbt_views.PSBTRefusalView, before_run=assert_code, screen_return_value=0),
+            FlowStep(MainMenuView),
+        ])
+        assert self.controller.psbt is None
+
+
 def sp_send_request(tweak: int = 0x02, recipients: list = None, modifiable: int = 0x03,
                     sighash: int = None) -> bytes:
     """
@@ -2281,6 +2420,70 @@ class TestSendRoundTwo:
         signed = silent_payments.psbt_bytes(p)
         assert undo_send_changes(signed, supplied) == supplied
         assert dict(input_records(signed))[b"\x03"] == (1).to_bytes(4, "little")
+
+
+class StubScreenRenderer:
+    """A 240x240 stand-in for the hardware renderer, as tests/test_psbt_refusal_screens.py uses."""
+    def __init__(self, width: int = 240, height: int = 240):
+        import threading
+        from PIL import Image, ImageDraw
+
+        self.canvas_width = width
+        self.canvas_height = height
+        self.canvas = Image.new("RGB", (width, height))
+        self.draw = ImageDraw.Draw(self.canvas)
+        self.lock = threading.Lock()
+
+    def show_image(self, *args, **kwargs):
+        pass
+
+
+class TestSendRecipientScreen:
+    """
+    The recipient screen is where the user compares the address they were given
+    against the one this device is about to pay, so it has to show all of it. A
+    Silent Payment address is 116 characters on mainnet and 117 on testnet, nearly
+    twice a Taproot address, and the screen used to crop whatever did not fit --
+    taking the checksum with it.
+    """
+    @pytest.fixture(autouse=True)
+    def stub_renderer(self):
+        from unittest.mock import patch
+        from seedsigner.gui.renderer import Renderer
+
+        with patch.object(Renderer, "get_instance", return_value=StubScreenRenderer()):
+            yield
+
+    def build(self, address: str):
+        from seedsigner.gui.screens.psbt_screens import PSBTAddressDetailsScreen
+        from seedsigner.gui.screens.screen import ButtonOption
+
+        return PSBTAddressDetailsScreen(
+            title="Will Send", button_data=[ButtonOption("Next")],
+            address=address, amount=10_000,
+        )
+
+    @pytest.mark.parametrize("address", [
+        ABANDON_MAINNET_ADDRESS,
+        ABANDON_TESTNET_ADDRESS,
+        "bc1q3vu7vdfhh6lrm0dym7q8zyt5nvgk4m9ge7hrf5",
+        "bc1p5cyxnuxmeuwuvkwfem96l6qy0kmnsz8vgudsl8sfxjcmexnrfunsvhwdcd",
+    ])
+    def test_the_whole_address_is_shown(self, address):
+        screen = self.build(address)
+        drawn = "".join(text for _xy, text, _color, _font in screen.formatted_address.text_params)
+        assert "..." not in drawn
+        assert drawn.replace(" ", "") == address
+
+    @pytest.mark.parametrize("address", [ABANDON_MAINNET_ADDRESS, ABANDON_TESTNET_ADDRESS])
+    def test_it_fits_above_the_button(self, address):
+        screen = self.build(address)
+        assert screen.body_img.height <= screen.center_img_height
+
+    def test_an_ordinary_address_still_uses_the_usual_size(self):
+        """Shrinking is for the addresses that need it, not for every screen."""
+        screen = self.build("bc1q3vu7vdfhh6lrm0dym7q8zyt5nvgk4m9ge7hrf5")
+        assert screen.formatted_address.font_size == 24
 
 
 class TestSharedScanKeyOrdering:

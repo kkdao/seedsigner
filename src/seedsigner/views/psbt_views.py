@@ -757,8 +757,11 @@ class PSBTOverviewView(View):
         num_self_transfer_outputs = 0
         for change_output in change_data:
             # PSBTParser has already rejected any derivation a wallet could not
-            # scan for, so all that's left here is which branch it sits on.
-            if PSBTParser.is_change_branch(change_output["verified_derivation_path"]):
+            # scan for, so all that's left here is which branch it sits on. Silent
+            # Payment change has no derivation: it is change because its code is this
+            # seed's scan key and its label-0 spend key.
+            if change_output.get("silent_payment") or PSBTParser.is_change_branch(
+                    change_output["verified_derivation_path"] or []):
                 num_change_outputs += 1
             else:
                 num_self_transfer_outputs += 1
@@ -1097,6 +1100,11 @@ class PSBTChangeDetailsView(View):
         verified_derivation_path = change_data.get("verified_derivation_path")
         path_ints = list(verified_derivation_path) if verified_derivation_path else []
 
+        # Silent Payment change has no derivation path to re-derive: the parser matched
+        # it against this seed's scan key and its label-0 spend key, which is the whole
+        # of what makes such an output change.
+        is_silent_payment_change = bool(change_data.get("silent_payment"))
+
         if self.controller.psbt_seed:
             seed_fingerprint = self.controller.psbt_seed.get_fingerprint(
                 self.settings.get_value(SettingsConstants.SETTING__NETWORK)
@@ -1109,7 +1117,8 @@ class PSBTChangeDetailsView(View):
         # Safe to read from the verified path here: PSBTParser has already refused any
         # path whose prefix does not match one the inputs demonstrate, so an output that
         # reaches this point sits where this wallet actually keeps its keys.
-        is_change_derivation_path = PSBTParser.is_change_branch(path_ints)
+        is_change_derivation_path = (PSBTParser.is_change_branch(path_ints)
+                                     or is_silent_payment_change)
         derivation_path_addr_index = path_ints[-1] & 0x7FFFFFFF if path_ints else 0
 
         if is_change_derivation_path:
@@ -1154,6 +1163,10 @@ class PSBTChangeDetailsView(View):
             else:
                 # Have the Screen offer to load in the multisig descriptor.
                 button_data = [self.VERIFY_MULTISIG, self.SKIP_VERIFICATION]
+
+        elif is_silent_payment_change:
+            is_change_addr_verified = True
+            button_data = [self.NEXT]
 
         else:
             # Single sig
