@@ -11,9 +11,10 @@ none).
 """
 from io import BytesIO
 
-from embit import bech32, compact, ec
+from embit import bech32, compact, ec, hashes
 from embit.bip32 import HARDENED_INDEX as H
 from embit.transaction import SIGHASH
+from embit.util import key as pykey, secp256k1
 
 from seedsigner.models.settings_definition import SettingsConstants
 
@@ -30,6 +31,13 @@ SEND_KEY_TYPES = {"global": (0x07, 0x08), "input": (0x1D, 0x1E), "output": (0x09
 IN_SP_SPEND_BIP32_DERIVATION = 0x1F
 IN_SP_TWEAK = 0x20
 IN_TAP_KEY_SIG = b"\x13"
+IN_PARTIAL_SIG = b"\x02"
+IN_SIGHASH_TYPE = b"\x03"
+GLOBAL_TX_MODIFIABLE = b"\x06"
+OUT_SCRIPT = b"\x04"
+
+# BIP-352's limit on payments sharing one scan key, which bounds a receiver's scan.
+K_MAX = 2323
 
 # The secp256k1 group order.
 N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
@@ -126,10 +134,12 @@ def remember_bytes(psbt, raw: bytes):
     as. A BIP-376 answer has to: the coordinator compares the response against the
     request field by field. See splice_signatures.
 
-    Only a spend, so that no other flow's export changes, and so a large psbt read
-    from a card is not held twice for nothing.
+    Only a Silent Payment psbt, so that no other flow's export changes, and so a large
+    psbt read from a card is not held twice for nothing. A send (BIP-375) needs it as
+    much as a spend: its response is the request plus the scripts, proofs and
+    signatures this device adds.
     """
-    if any(is_spend_input(inp) for inp in psbt.inputs):
+    if any(is_spend_input(inp) for inp in psbt.inputs) or has_send_fields(psbt):
         setattr(psbt, _OWN_BYTES, bytes(raw))
 
 
@@ -143,22 +153,27 @@ def psbt_bytes(psbt) -> bytes:
 
 
 def _maps(raw: bytes) -> list:
-    """Each key-value map of a serialized psbt, as (fields, offset of its terminator)."""
+    """
+    Each key-value map of a serialized psbt, as (fields, the offset of its terminator,
+    the records in the order they were written as (key, value, start, end)).
+    """
     stream = BytesIO(raw)
     if stream.read(5) != b"psbt\xff":
         raise ValueError("not a psbt")
-    maps, fields = [], {}
+    maps, fields, records = [], {}, []
     while stream.tell() < len(raw):
+        start = stream.tell()
         key_length = compact.read_from(stream)
         if key_length == 0:
-            maps.append((fields, stream.tell() - 1))
-            fields = {}
+            maps.append((fields, start, records))
+            fields, records = {}, []
             continue
         key = stream.read(key_length)
         value = stream.read(compact.read_from(stream))
         if len(key) != key_length or key in fields:
             raise ValueError("truncated or duplicated field")
         fields[key] = value
+        records.append((key, value, start, stream.tell()))
     if fields:
         raise ValueError("unterminated map")
     return maps
@@ -181,7 +196,7 @@ def splice_signatures(psbt, signatures: list) -> bytes:
         raise ValueError("the psbt's own bytes describe another transaction")
 
     signed, copied = bytearray(), 0
-    for (fields, terminator), inp, signature in zip(maps[1:], psbt.inputs, signatures):
+    for (fields, terminator, _records), inp, signature in zip(maps[1:], psbt.inputs, signatures):
         spend = {k: v for k, v in inp.unknown.items()
                  if k[0] in (IN_SP_SPEND_BIP32_DERIVATION, IN_SP_TWEAK)}
         if ({k: v for k, v in fields.items() if k[0] in (IN_SP_SPEND_BIP32_DERIVATION, IN_SP_TWEAK)} != spend
@@ -277,3 +292,213 @@ def sign_spend_inputs(psbt, seed, network: str) -> int:
         inp.unknown[IN_TAP_KEY_SIG] = sig
     remember_bytes(psbt, signed)
     return len(signatures)
+
+
+# ---- Sending to a Silent Payment address (BIP-375) -----------------------------------
+
+def _point(sec: bytes) -> ec.PublicKey:
+    """A compressed public key, as ec.PublicKey. ValueError if it is not one."""
+    try:
+        return ec.PublicKey.parse(sec)
+    except Exception as e:
+        raise ValueError("not a public key") from e
+
+
+def _generator() -> ec.PublicKey:
+    """secp256k1's G. BIP-374 takes the generator as an argument; this is the only one used."""
+    return ec.PrivateKey((1).to_bytes(32, "big")).get_public_key()
+
+
+def _lincomb(pairs) -> ec.PublicKey:
+    """
+    The sum of scalar*point over `pairs`, or None for the point at infinity.
+
+    Every elliptic curve operation Silent Payments needs is one of these, so this is
+    the only place a backend difference can show up: embit's ctypes bindings do the
+    multiplication in libsecp256k1, and its pure-Python fallback (a device without
+    the library) has no ec_pubkey_tweak_mul, so the curve arithmetic embit uses to
+    implement its own point addition is used directly instead. See _lincomb_python.
+    """
+    terms = [(point, scalar % N) for point, scalar in pairs]
+    terms = [(point, scalar) for point, scalar in terms if scalar]
+    if not terms:
+        return None
+    if not hasattr(secp256k1, "ec_pubkey_tweak_mul"):
+        return _lincomb_python(terms)
+    points = []
+    for point, scalar in terms:
+        # ec_pubkey_parse returns the library's own 64-byte internal point, and
+        # ec_pubkey_tweak_mul multiplies it in place, as embit's own code does.
+        pub = secp256k1.ec_pubkey_parse(point.sec())
+        secp256k1.ec_pubkey_tweak_mul(pub, scalar.to_bytes(32, "big"))
+        points.append(pub)
+    try:
+        return ec.PublicKey(secp256k1.ec_pubkey_combine(*points))
+    except Exception:
+        # The only way a sum of valid points fails is that it is the point at infinity.
+        return None
+
+
+def _lincomb_python(terms) -> ec.PublicKey:
+    """_lincomb on embit's pure-Python curve, which sums the whole combination at once."""
+    points = []
+    for point, scalar in terms:
+        parsed = pykey.ECPubKey()
+        parsed.set(point.sec())
+        if not parsed.valid:
+            raise ValueError("not a public key")
+        points.append((parsed.p, scalar))
+    total = pykey.SECP256K1.affine(pykey.SECP256K1.mul(points))
+    if total is None:
+        return None
+    result = pykey.ECPubKey()
+    result.p, result.valid, result.compressed = total, True, True
+    return ec.PublicKey.parse(bytes(result.get_bytes()))
+
+
+def _scalar(data: bytes) -> int:
+    """A 32-byte hash as a scalar. ValueError if it is 0 or not below the group order."""
+    value = int.from_bytes(data, "big")
+    if not 0 < value < N:
+        raise ValueError("not a valid scalar")
+    return value
+
+
+def _dleq_challenge(a_point, b_point, c_point, r1, r2, generator_point, message: bytes) -> int:
+    parts = (a_point, b_point, c_point, generator_point, r1, r2)
+    return int.from_bytes(
+        hashes.tagged_hash("BIP0374/challenge", b"".join(p.sec() for p in parts) + message), "big"
+    ) % N
+
+
+def _dleq_nonce(secret: bytes, a_point, c_point, aux: bytes, message: bytes) -> bytes:
+    tweaked = bytes(a ^ b for a, b in zip(secret, hashes.tagged_hash("BIP0374/aux", aux)))
+    rand = hashes.tagged_hash("BIP0374/nonce", tweaked + a_point.sec() + c_point.sec() + message)
+    return (int.from_bytes(rand, "big") % N).to_bytes(32, "big")
+
+
+def dleq_prove(secret: bytes, b_point: ec.PublicKey, aux: bytes, message: bytes = b"",
+               generator: ec.PublicKey = None) -> bytes:
+    """
+    BIP-374 GenerateProof: proof that C = secret*B and A = secret*G share one secret,
+    as bytes(32, e) || bytes(32, s). `aux` must be fresh randomness for each proof.
+
+    Raises ValueError for a secret out of range, a nonce of zero, or a proof that
+    does not verify, so a proof is never handed out unchecked.
+    """
+    g = generator or _generator()
+    a = int.from_bytes(secret, "big")
+    if not 0 < a < N:
+        raise ValueError("secret out of range")
+    a_point, c_point = _lincomb([(g, a)]), _lincomb([(b_point, a)])
+    if a_point is None or c_point is None:
+        raise ValueError("statement is the point at infinity")
+    k = int.from_bytes(_dleq_nonce(secret, a_point, c_point, aux, message), "big")
+    if k == 0:
+        raise ValueError("nonce is zero")
+    r1, r2 = _lincomb([(g, k)]), _lincomb([(b_point, k)])
+    if r1 is None or r2 is None:
+        raise ValueError("nonce point is the point at infinity")
+    e = _dleq_challenge(a_point, b_point, c_point, r1, r2, g, message)
+    s = (k + e * a) % N
+    proof = e.to_bytes(32, "big") + s.to_bytes(32, "big")
+    if not dleq_verify(a_point, b_point, c_point, proof, message=message, generator=g):
+        raise ValueError("proof does not verify")
+    return proof
+
+
+def dleq_verify(a_point: ec.PublicKey, b_point: ec.PublicKey, c_point: ec.PublicKey,
+                proof: bytes, message: bytes = b"", generator: ec.PublicKey = None) -> bool:
+    """
+    BIP-374 VerifyProof: whether `proof` shows that A and C come from one secret.
+
+    Returns False rather than raising, so a coordinator's proof that does not hold is
+    a decision the caller makes (a refusal), not an exception path.
+    """
+    g = generator or _generator()
+    if len(proof) != 64:
+        return False
+    e, s = int.from_bytes(proof[:32], "big"), int.from_bytes(proof[32:], "big")
+    if e >= N or s >= N:
+        return False
+    r1 = _lincomb([(g, s), (a_point, N - e)])
+    r2 = _lincomb([(b_point, s), (c_point, N - e)])
+    if r1 is None or r2 is None:
+        return False
+    return e == _dleq_challenge(a_point, b_point, c_point, r1, r2, g, message)
+
+
+def ecdh_share(secret: bytes, b_point: ec.PublicKey) -> ec.PublicKey:
+    """C = secret*B_scan, the ECDH share BIP-375 publishes with a DLEQ proof."""
+    share = _lincomb([(b_point, int.from_bytes(secret, "big"))])
+    if share is None:
+        raise ValueError("ECDH share is the point at infinity")
+    return share
+
+
+def even_y_secret(secret: bytes) -> bytes:
+    """
+    A Taproot input's key as BIP-352 uses it: negated when its point has odd Y.
+
+    The receiver sums the x-only output keys and so assumes even Y for each of them;
+    a sender that skipped this would compute a shared secret nobody can find.
+    """
+    if ec.PrivateKey(secret).get_public_key().sec()[0] == 0x02:
+        return secret
+    return (N - int.from_bytes(secret, "big")).to_bytes(32, "big")
+
+
+def secret_sum(secrets: list) -> bytes:
+    """a = a_1 + ... + a_n mod n. ValueError if the sum is zero, as BIP-352 requires."""
+    total = sum(int.from_bytes(secret, "big") for secret in secrets) % N
+    if total == 0:
+        raise ValueError("the input keys sum to zero")
+    return total.to_bytes(32, "big")
+
+
+def input_hash(outpoints: list, a_point: ec.PublicKey) -> bytes:
+    """
+    BIP-352's input_hash, binding the payment to this exact set of inputs: the
+    smallest outpoint of the whole transaction, serialized, and A = a*G.
+    """
+    if not outpoints:
+        raise ValueError("no inputs to hash")
+    digest = hashes.tagged_hash("BIP0352/Inputs", min(outpoints) + a_point.sec())
+    _scalar(digest)
+    return digest
+
+
+def output_script(share: ec.PublicKey, spend_point: ec.PublicKey, hash_of_inputs: bytes,
+                  k: int) -> bytes:
+    """
+    The P2TR script paying recipient k of a scan-key group: B_m + t_k*G, where
+    t_k = hash_BIP0352/SharedSecret(ser(input_hash*C) || ser32(k)) and C is the ECDH
+    share. Raises ValueError if any scalar is out of range, rather than paying a key
+    the recipient cannot find.
+    """
+    shared = _lincomb([(share, _scalar(hash_of_inputs))])
+    if shared is None:
+        raise ValueError("shared secret is the point at infinity")
+    tweak = hashes.tagged_hash("BIP0352/SharedSecret", shared.sec() + k.to_bytes(4, "big"))
+    output = _lincomb([(_generator(), _scalar(tweak)), (spend_point, 1)])
+    if output is None:
+        raise ValueError("output key is the point at infinity")
+    return b"\x51\x20" + output.xonly()
+
+
+def code_order(codes: list) -> list:
+    """
+    The k of each output, from its (scan key, spend key) pair, per BIP-375: codes
+    sharing a scan key are sorted lexicographically, and codes sharing both keys by
+    output index. Output order alone is not the ordering.
+    """
+    groups = {}
+    for index, (scan, spend) in enumerate(codes):
+        groups.setdefault(scan, []).append((spend, index))
+    order = {}
+    for members in groups.values():
+        if len(members) > K_MAX:
+            raise ValueError("too many payments to one scan key")
+        for k, (_, index) in enumerate(sorted(members)):
+            order[index] = k
+    return [order[index] for index in range(len(codes))]

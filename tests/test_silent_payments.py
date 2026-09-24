@@ -10,6 +10,7 @@ any one of them still shows up:
 * Sparrow's drongo seed tests (testnet address);
 * kiss-signer's (keys, addresses and the sp(...) scan export for abandon...about).
 """
+import csv
 import hashlib
 import json
 import logging
@@ -1208,3 +1209,226 @@ class TestSpendFlow(FlowTest):
             FlowStep(psbt_views.PSBTRefusalView, before_run=assert_code, screen_return_value=0),
             FlowStep(MainMenuView),
         ])
+
+
+# ---- BIP-375: sending to a Silent Payment address ------------------------------------
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+def data_file(name: str):
+    with open(os.path.join(DATA_DIR, name)) as f:
+        return json.load(f) if name.endswith(".json") else list(csv.DictReader(f))
+
+
+def hex_point(value: str) -> ec.PublicKey:
+    return ec.PublicKey.parse(bytes.fromhex(value))
+
+
+def bip374_prove(a: int, b: tuple, k: int, generator: tuple, message: bytes) -> bytes:
+    """BIP-374 GenerateProof with k given, written out here so the check owes nothing
+    to the helper: proof = bytes(32, e) || bytes(32, s)."""
+    def cbytes(point):
+        return bytes([2 + point[1] % 2]) + point[0].to_bytes(32, "big")
+
+    a_point, c_point = _point_mul(generator, a), _point_mul(b, a)
+    r1, r2 = _point_mul(generator, k), _point_mul(b, k)
+    challenge = _tagged_hash(
+        "BIP0374/challenge",
+        cbytes(a_point) + cbytes(b) + cbytes(c_point) + cbytes(generator) + cbytes(r1) + cbytes(r2) + message,
+    )
+    e = int.from_bytes(challenge, "big") % SECP_N
+    s = (k + e * a) % SECP_N
+    return e.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+class TestDleqVectors:
+    """
+    BIP-374's own generate and verify vectors, unmodified, from
+    bitcoin/bips/bip-0374. They pass the generator point in, so the helper takes one
+    too; every device path uses secp256k1's own G.
+    """
+    @pytest.mark.parametrize("row", data_file("bip374_generate_proof_vectors.csv"),
+                             ids=lambda row: row["comment"])
+    def test_generate(self, row):
+        if row["point_B"] == "INFINITY":
+            # The point at infinity has no compressed encoding, so it cannot reach the
+            # helper: the vector states it in words, and there is nothing to parse.
+            with pytest.raises(ValueError):
+                bytes.fromhex(row["point_B"])
+            return
+        secret = bytes.fromhex(row["scalar_a"])
+        aux = bytes.fromhex(row["auxrand_r"])
+        message = bytes.fromhex(row["message"])
+        if row["result_proof"] == "INVALID":
+            with pytest.raises(ValueError):
+                silent_payments.dleq_prove(
+                    secret, hex_point(row["point_B"]), aux, message=message,
+                    generator=hex_point(row["point_G"]),
+                )
+            return
+        proof = silent_payments.dleq_prove(
+            secret, hex_point(row["point_B"]), aux, message=message,
+            generator=hex_point(row["point_G"]),
+        )
+        assert proof.hex() == row["result_proof"]
+
+    @pytest.mark.parametrize("row", data_file("bip374_verify_proof_vectors.csv"),
+                             ids=lambda row: row["comment"])
+    def test_verify(self, row):
+        verified = silent_payments.dleq_verify(
+            hex_point(row["point_A"]), hex_point(row["point_B"]), hex_point(row["point_C"]),
+            bytes.fromhex(row["proof"]), message=bytes.fromhex(row["message"]),
+            generator=hex_point(row["point_G"]),
+        )
+        assert verified is (row["result_success"] == "TRUE")
+
+    def test_proof_is_bound_to_its_randomness(self):
+        """Two proofs of the same statement differ, and each one verifies."""
+        secret = bytes.fromhex("11" * 32)
+        b_point = ec.PrivateKey(bytes.fromhex("22" * 32)).get_public_key()
+        a_point = ec.PrivateKey(secret).get_public_key()
+        share = silent_payments.ecdh_share(secret, b_point)
+        first = silent_payments.dleq_prove(secret, b_point, bytes.fromhex("33" * 32))
+        second = silent_payments.dleq_prove(secret, b_point, bytes.fromhex("44" * 32))
+        assert first != second
+        for proof in (first, second):
+            assert len(proof) == 64
+            assert silent_payments.dleq_verify(a_point, b_point, share, proof)
+
+    def test_a_tampered_share_is_refused(self):
+        secret = bytes.fromhex("11" * 32)
+        b_point = ec.PrivateKey(bytes.fromhex("22" * 32)).get_public_key()
+        a_point = ec.PrivateKey(secret).get_public_key()
+        proof = silent_payments.dleq_prove(secret, b_point, bytes.fromhex("33" * 32))
+        other = silent_payments.ecdh_share(bytes.fromhex("55" * 32), b_point)
+        assert not silent_payments.dleq_verify(a_point, b_point, other, proof)
+
+    def test_the_proof_matches_an_independent_implementation(self):
+        """The helper's proof against BIP-374 written out in this file, nonce included."""
+        secret = bytes.fromhex("0f" + "3c" * 31)
+        b_secret = bytes.fromhex("77" * 32)
+        aux = bytes.fromhex("5a" * 32)
+        b_point = ec.PrivateKey(b_secret).get_public_key()
+        a = int.from_bytes(secret, "big")
+        b = _point_mul(SECP_G, int.from_bytes(b_secret, "big"))
+
+        def cbytes(point):
+            return bytes([2 + point[1] % 2]) + point[0].to_bytes(32, "big")
+
+        tweaked = bytes(x ^ y for x, y in zip(secret, _tagged_hash("BIP0374/aux", aux)))
+        rand = _tagged_hash(
+            "BIP0374/nonce", tweaked + cbytes(_point_mul(SECP_G, a)) + cbytes(_point_mul(b, a))
+        )
+        k = int.from_bytes(rand, "big") % SECP_N
+
+        assert silent_payments.dleq_prove(secret, b_point, aux) == bip374_prove(a, b, k, SECP_G, b"")
+
+    def test_the_pure_python_curve_agrees_with_the_library(self, monkeypatch):
+        """
+        A device without libsecp256k1 runs the same maths through embit's own pure
+        curve, so every point this module computes must come out the same either way.
+        """
+        secret = bytes.fromhex("0f" + "3c" * 31)
+        b_point = ec.PrivateKey(bytes.fromhex("77" * 32)).get_public_key()
+        a_point = ec.PrivateKey(secret).get_public_key()
+        aux = bytes.fromhex("5a" * 32)
+        with_library = (silent_payments.ecdh_share(secret, b_point).sec(),
+                        silent_payments.dleq_prove(secret, b_point, aux))
+
+        monkeypatch.delattr(silent_payments.secp256k1, "ec_pubkey_tweak_mul", raising=False)
+        pure = (silent_payments.ecdh_share(secret, b_point).sec(),
+                silent_payments.dleq_prove(secret, b_point, aux))
+        assert pure == with_library
+        assert silent_payments.dleq_verify(a_point, b_point,
+                                          silent_payments.ecdh_share(secret, b_point), pure[1])
+
+
+# A coordinator's request, written out field by field so the bytes the device answers
+# with can be compared against bytes this file produced, not against embit's output.
+
+
+BIP352_SENDING = data_file("bip352_sending_vectors.json")
+
+
+def sending_cases(with_outputs=True) -> list:
+    cases = []
+    for case in BIP352_SENDING:
+        given = case["sending"][0]
+        has = bool(given["expected"]["outputs"] and given["expected"]["outputs"][0])
+        if has == with_outputs:
+            cases.append(case)
+    return cases
+
+
+class TestBip352SendingVectors:
+    """
+    BIP-352's own sending vectors, the sending half of send_and_receive_test_vectors.json
+    as bitcoin/bips publishes it. Each case's own input key sum is used, so what is under
+    test is the derivation and not this file's idea of which inputs are eligible.
+    """
+    @pytest.mark.parametrize("case", sending_cases(), ids=lambda case: case["comment"][:48])
+    def test_outputs(self, case):
+        given = case["sending"][0]["given"]
+        expected = case["sending"][0]["expected"]
+        secret = bytes.fromhex(expected["input_private_key_sum"])
+        outpoints = [bytes.fromhex(v["txid"])[::-1] + v["vout"].to_bytes(4, "little")
+                     for v in given["vin"]]
+        a_point = ec.PrivateKey(secret).get_public_key()
+        hash_of_inputs = silent_payments.input_hash(outpoints, a_point)
+
+        codes = [(bytes.fromhex(r["scan_pub_key"]), bytes.fromhex(r["spend_pub_key"]))
+                 for r in given["recipients"]]
+        shares = {scan: silent_payments.ecdh_share(secret, ec.PublicKey.parse(scan))
+                  for scan, _ in codes}
+        got = {silent_payments.output_script(shares[scan], ec.PublicKey.parse(spend),
+                                            hash_of_inputs, k)[2:].hex()
+               for (scan, spend), k in zip(codes, silent_payments.code_order(codes))}
+        # BIP-352 lets the sender order a scan key's recipients as it likes, so the
+        # vectors list every valid set; BIP-375 is what narrows it to one.
+        assert any(got == set(alternative) for alternative in expected["outputs"])
+
+    def test_the_shared_secret_of_each_group_matches(self):
+        """The ECDH share itself, against the vectors' own shared_secrets."""
+        for case in sending_cases():
+            given, expected = case["sending"][0]["given"], case["sending"][0]["expected"]
+            secret = bytes.fromhex(expected["input_private_key_sum"])
+            outpoints = [bytes.fromhex(v["txid"])[::-1] + v["vout"].to_bytes(4, "little")
+                         for v in given["vin"]]
+            hash_of_inputs = silent_payments.input_hash(
+                outpoints, ec.PrivateKey(secret).get_public_key())
+            for recipient, shared in zip(given["recipients"], expected["shared_secrets"]):
+                scan = ec.PublicKey.parse(bytes.fromhex(recipient["scan_pub_key"]))
+                share = silent_payments.ecdh_share(secret, scan)
+                tweaked = silent_payments._lincomb(
+                    [(share, int.from_bytes(hash_of_inputs, "big"))])
+                assert tweaked.sec().hex() == shared
+
+    def test_input_keys_that_sum_to_zero_are_refused(self):
+        case = next(c for c in BIP352_SENDING if "sum up to zero" in c["comment"])
+        keys = [bytes.fromhex(v["private_key"]) for v in case["sending"][0]["given"]["vin"]]
+        with pytest.raises(ValueError, match="sum to zero"):
+            silent_payments.secret_sum(keys)
+
+    def test_an_intermediate_sum_of_zero_is_fine(self):
+        case = next(c for c in BIP352_SENDING if "intermediate sum is zero" in c["comment"])
+        given, expected = case["sending"][0]["given"], case["sending"][0]["expected"]
+        keys = []
+        for vin in given["vin"]:
+            secret = bytes.fromhex(vin["private_key"])
+            taproot = vin["prevout"]["scriptPubKey"]["hex"].startswith("5120")
+            keys.append(silent_payments.even_y_secret(secret) if taproot else secret)
+        assert silent_payments.secret_sum(keys).hex() == expected["input_private_key_sum"]
+
+    def test_the_group_limit_is_enforced(self):
+        """
+        BIP-352 fails a group of more than K_max payments to one scan key, which bounds
+        what a receiver has to scan. The vector's own recipient list is generated rather
+        than written out, so the limit is exercised directly.
+        """
+        scan = ec.PrivateKey(bytes.fromhex("6b" * 32)).get_public_key().sec()
+        assert any("K_max" in case["comment"] for case in BIP352_SENDING)
+        codes = [(scan, i.to_bytes(33, "big")) for i in range(silent_payments.K_MAX + 1)]
+        with pytest.raises(ValueError, match="too many payments"):
+            silent_payments.code_order(codes)
+        silent_payments.code_order(codes[:-1])
