@@ -846,27 +846,32 @@ class TestSpendRefusals:
         silent_payments.sign_spend_inputs(p, abandon_seed(), TESTNET)
         assert_signatures_verify(p)
 
-    @pytest.mark.parametrize("scope, key", [
-        ("global", b"\x07" + bytes.fromhex(KISS_KEYS[TESTNET][0])),
-        ("global", b"\x08" + bytes.fromhex(KISS_KEYS[TESTNET][0])),
-        ("input", b"\x1d" + bytes.fromhex(KISS_KEYS[TESTNET][0])),
-        ("input", b"\x1e" + bytes.fromhex(KISS_KEYS[TESTNET][0])),
-        ("output", b"\x09"),
-        ("output", b"\x0a"),
+    @pytest.mark.parametrize("scope, key, match", [
+        ("global", b"\x07" + bytes.fromhex(KISS_KEYS[TESTNET][0]), "no Silent Payment output"),
+        ("global", b"\x08" + bytes.fromhex(KISS_KEYS[TESTNET][0]), "no Silent Payment output"),
+        ("input", b"\x1d" + bytes.fromhex(KISS_KEYS[TESTNET][0]), "no Silent Payment output"),
+        ("input", b"\x1e" + bytes.fromhex(KISS_KEYS[TESTNET][0]), "no Silent Payment output"),
+        ("output", b"\x09", "malformed Silent Payment field"),
+        ("output", b"\x0a", "label but no keys"),
     ])
-    def test_send_fields_refused_before_the_output_check(self, scope, key):
-        """BIP-375 fields are refused first, even on a psbt whose output has no script."""
+    def test_send_fields_refused_before_the_output_check(self, scope, key, match):
+        """
+        A BIP-375 field that cannot be acted on is refused first, even on a psbt whose
+        output has no script: a send legitimately arrives without one, so the reason
+        the user sees must be the field, not the missing script.
+        """
         p = sp_psbt("01-sp-spend-1in")
         p.outputs[0].script_pubkey = None
         {"global": p, "input": p.inputs[0], "output": p.outputs[1]}[scope].unknown[key] = b"\x01" * 33
-        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="Sending to Silent Payment")
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match=match)
 
     def test_send_fields_refused_on_ordinary_psbt(self):
+        """A Silent Payment output whose keys are the wrong length is not a recipient."""
         p = parse_kept(a2b_base64(KISS_SPEND_VECTORS["even"][0]))
         for key in list(p.inputs[0].unknown):
             del p.inputs[0].unknown[key]
-        p.outputs[0].unknown[b"\x09"] = b"\x01" * 66
-        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="Sending to Silent Payment")
+        p.outputs[0].unknown[b"\x09"] = b"\x01" * 33
+        assert_refused(p, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="malformed Silent Payment field")
 
     def test_v0_refused(self):
         p = sp_psbt("01-sp-spend-1in")
@@ -1347,8 +1352,545 @@ class TestDleqVectors:
 # A coordinator's request, written out field by field so the bytes the device answers
 # with can be compared against bytes this file produced, not against embit's output.
 
+SEND_PATHS = {
+    "p2tr": "m/86h/1h/0h/0/0",
+    "p2wpkh": "m/84h/1h/0h/0/0",
+    "p2sh-p2wpkh": "m/49h/1h/0h/0/0",
+    "p2pkh": "m/44h/1h/0h/0/0",
+}
+
+
+def write_map(fields: dict) -> bytes:
+    out = bytearray()
+    for key, value in fields.items():
+        out += compact.to_bytes(len(key)) + key
+        out += compact.to_bytes(len(value)) + value
+    return bytes(out) + b"\x00"
+
+
+def path_field(fingerprint: bytes, path: list) -> bytes:
+    return fingerprint + b"".join(i.to_bytes(4, "little") for i in path)
+
+
+def prevout_script(kind: str, key) -> script.Script:
+    pkh = hashlib.new("ripemd160", hashlib.sha256(key.sec()).digest()).digest()
+    if kind == "p2tr":
+        return script.Script(b"\x51\x20" + key.taproot_tweak(b"").xonly())
+    if kind == "p2wpkh":
+        return script.Script(b"\x00\x14" + pkh)
+    if kind == "p2sh-p2wpkh":
+        redeem = b"\x00\x14" + pkh
+        return script.Script(b"\xa9\x14" + hashlib.new("ripemd160", hashlib.sha256(redeem).digest()).digest() + b"\x87")
+    return script.Script(b"\x76\xa9\x14" + pkh + b"\x88\xac")
+
+
+def send_request(kind: str = "p2wpkh", recipients: list = None, ordinary_outputs: list = None,
+                 seed=None, network=TESTNET, inputs: int = 1, modifiable: int = 0x03,
+                 sighash: int = None, extra_input_fields: dict = None) -> bytes:
+    """
+    A BIP-375 request: `inputs` inputs of one kind belonging to `seed`, and one output
+    per (scan key, spend key, label) in `recipients` with no script yet.
+    """
+    from embit.transaction import Transaction, TransactionInput, TransactionOutput
+
+    seed = seed or abandon_seed()
+    root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(" ".join(seed.mnemonic_list)))
+    derived = root.derive(SEND_PATHS[kind])
+    key, fingerprint = derived.key, root.my_fingerprint
+    path = bip32.parse_path(SEND_PATHS[kind])
+    spk = prevout_script(kind, key)
+    pkh = hashlib.new("ripemd160", hashlib.sha256(key.sec()).digest()).digest()
+
+    # Each input covers its share of the outputs plus a plausible fee, so the flow is an
+    # ordinary transaction and not one the risk screens stop.
+    spent = 10_000 * len(recipients or []) + sum(value for value, _ in (ordinary_outputs or []))
+    input_value = (spent + 1_000 + inputs - 1) // inputs
+
+    global_fields = {
+        b"\x02": (2).to_bytes(4, "little"),
+        b"\x04": compact.to_bytes(inputs),
+        b"\x05": compact.to_bytes(len(recipients or []) + len(ordinary_outputs or [])),
+        b"\xfb": (2).to_bytes(4, "little"),
+    }
+    if modifiable is not None:
+        global_fields[b"\x06"] = bytes([modifiable])
+    raw = bytearray(b"psbt\xff") + write_map(global_fields)
+
+    for index in range(inputs):
+        prev = Transaction(version=2, vin=[TransactionInput(bytes([0x11 + index]) * 32, 0)],
+                           vout=[TransactionOutput(input_value, spk)])
+        fields = {}
+        if kind == "p2pkh":
+            fields[b"\x00"] = prev.serialize()
+        else:
+            fields[b"\x01"] = TransactionOutput(input_value, spk).serialize()
+        if sighash is not None:
+            fields[b"\x03"] = sighash.to_bytes(4, "little")
+        if kind == "p2sh-p2wpkh":
+            fields[b"\x04"] = b"\x00\x14" + pkh
+        if kind == "p2tr":
+            fields[b"\x16" + key.xonly()] = compact.to_bytes(0) + path_field(fingerprint, path)
+        else:
+            fields[b"\x06" + key.sec()] = path_field(fingerprint, path)
+        # PSBT_IN_PREVIOUS_TXID is the txid as the transaction serializes it, which is
+        # the reverse of the order embit's txid() prints.
+        fields[b"\x0e"] = bytes(reversed(prev.txid()))
+        fields[b"\x0f"] = (0).to_bytes(4, "little")
+        fields[b"\x10"] = (0xFFFFFFFD).to_bytes(4, "little")
+        fields.update(extra_input_fields or {})
+        raw += write_map(fields)
+
+    for scan, spend, label in (recipients or []):
+        fields = {b"\x03": (10_000).to_bytes(8, "little"), b"\x09": scan + spend}
+        if label is not None:
+            fields[b"\x0a"] = label.to_bytes(4, "little")
+        raw += write_map(fields)
+    for value, output_script in (ordinary_outputs or []):
+        raw += write_map({b"\x03": value.to_bytes(8, "little"), b"\x04": output_script})
+    return bytes(raw)
+
+
+def rebuild(maps: list) -> bytes:
+    """A psbt's maps written back out, so a patched field's length stays right."""
+    return b"psbt\xff" + b"".join(write_map(m) for m in maps)
+
+
+def labeled_spend_key(seed, m: int, network=TESTNET) -> bytes:
+    """A recipient's B_m for label m, derived here rather than through the helper."""
+    scan, spend = silent_payments._keys(seed, network)
+    tweak = _tagged_hash("BIP0352/Label", scan.secret + m.to_bytes(4, "big"))
+    point = _point_add(_lift_x(spend.get_public_key().sec()),
+                       _point_mul(SECP_G, int.from_bytes(tweak, "big")))
+    return bytes([2 + point[1] % 2]) + point[0].to_bytes(32, "big")
+
+
+def sp_keys(seed=None, network=TESTNET) -> tuple:
+    """A seed's (scan public key, spend public key), as a coordinator writes them."""
+    scan, spend = silent_payments._keys(seed or abandon_seed(), network)
+    return scan.get_public_key().sec(), spend.get_public_key().sec()
+
+
+def stranger_seed() -> Seed:
+    return Seed(["zoo"] * 11 + ["wrong"])
+
+
+def change_code(seed=None, network=TESTNET) -> tuple:
+    """This wallet's own change code: its scan key and its label-0 spend key."""
+    seed = seed or abandon_seed()
+    return sp_keys(seed, network)[0], silent_payments._label_zero_spend_key(seed, network)
+
+
+def parsed_send(raw: bytes, seed=None, network=TESTNET) -> tuple:
+    p = parse_kept(raw)
+    parser = PSBTParser(p, seed=seed or abandon_seed(), network=network)
+    return p, parser
+
+
+def expected_send_scripts(raw: bytes, seed=None, network=TESTNET) -> list:
+    """
+    Every Silent Payment output's script, derived here from the request alone: the sum
+    of the input keys, BIP-352's input hash, and t_k for the k BIP-375 gives each code.
+    """
+    seed = seed or abandon_seed()
+    p = PSBT.parse(raw)
+    root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(" ".join(seed.mnemonic_list)))
+    secrets = []
+    for inp in p.inputs:
+        utxo = inp.utxo
+        data = utxo.script_pubkey.data
+        if len(data) == 34 and data[0] == 0x51:
+            pub, (_leaves, der) = list(inp.taproot_bip32_derivations.items())[0]
+            d = int.from_bytes(root.derive(der.derivation).key.taproot_tweak(b"").secret, "big")
+            secrets.append(d if not has_odd_y(d) else SECP_N - d)
+        else:
+            der = list(inp.bip32_derivations.values())[0]
+            secrets.append(int.from_bytes(root.derive(der.derivation).key.secret, "big"))
+    a = sum(secrets) % SECP_N
+    a_point = _point_mul(SECP_G, a)
+    outpoints = [bytes(inp.txid)[::-1] + inp.vout.to_bytes(4, "little") for inp in p.inputs]
+
+    def cbytes(point):
+        return bytes([2 + point[1] % 2]) + point[0].to_bytes(32, "big")
+
+    ih = _tagged_hash("BIP0352/Inputs", min(outpoints) + cbytes(a_point))
+    scripts, counters = {}, {}
+    for index, out in enumerate(p.outputs):
+        info = out.unknown.get(b"\x09")
+        if not info:
+            continue
+        scan, spend = info[:33], info[33:]
+        k = counters.get(scan, 0)
+        counters[scan] = k + 1
+        share = _point_mul(_lift_x(scan), a)
+        shared = _point_mul(share, int.from_bytes(ih, "big"))
+        t = _tagged_hash("BIP0352/SharedSecret", cbytes(shared) + k.to_bytes(4, "big"))
+        output = _point_add(_lift_x(spend), _point_mul(SECP_G, int.from_bytes(t, "big")))
+        scripts[index] = b"\x51\x20" + output[0].to_bytes(32, "big")
+    return scripts
+
+
+def _lift_x(sec: bytes) -> tuple:
+    """A compressed public key as a point, without embit."""
+    x = int.from_bytes(sec[1:], "big")
+    y = pow((pow(x, 3, SECP_P) + 7) % SECP_P, (SECP_P + 1) // 4, SECP_P)
+    if y * y % SECP_P != (pow(x, 3, SECP_P) + 7) % SECP_P:
+        raise ValueError("not on the curve")
+    return x, y if y % 2 == sec[0] % 2 else SECP_P - y
+
+
+KINDS = ["p2tr", "p2wpkh", "p2sh-p2wpkh", "p2pkh"]
+
+
+class TestSendPreparation:
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_the_output_script_is_computed_and_the_transaction_locked(self, kind):
+        raw = send_request(kind, [sp_keys(stranger_seed()) + (None,)])
+        p, parser = parsed_send(raw)
+        share_type, dleq_type = silent_payments.SEND_KEY_TYPES["global"]
+        scan = sp_keys(stranger_seed())[0]
+
+        assert p.outputs[0].script_pubkey.data == expected_send_scripts(raw)[0]
+        assert bytes([share_type]) + scan in p.unknown
+        assert bytes([dleq_type]) + scan in p.unknown
+        assert p.unknown[b"\x06"] == b"\x00"
+        assert PSBTParser.sig_count(p) == 0
+        assert parser.silent_payment_send
+        assert parser.silent_payment_recipients[0]["address"].startswith("tsp1")
+        assert parser.silent_payment_recipients[0]["change"] is False
+
+    def test_the_share_and_proof_verify_against_the_input_keys(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)], inputs=2)
+        p, _ = parsed_send(raw)
+        scan = sp_keys(stranger_seed())[0]
+        share = ec.PublicKey.parse(p.unknown[b"\x07" + scan])
+        proof = p.unknown[b"\x08" + scan]
+
+        secrets = []
+        root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(" ".join(ABANDON)))
+        for inp in p.inputs:
+            der = list(inp.bip32_derivations.values())[0]
+            secrets.append(int.from_bytes(root.derive(der.derivation).key.secret, "big"))
+        a = sum(secrets) % SECP_N
+        a_point = ec.PrivateKey(a.to_bytes(32, "big")).get_public_key()
+        assert share.sec() == silent_payments.ecdh_share(a.to_bytes(32, "big"),
+                                                         ec.PublicKey.parse(scan)).sec()
+        assert silent_payments.dleq_verify(a_point, ec.PublicKey.parse(scan), share, proof)
+
+    def test_a_second_payment_to_the_same_address_gets_the_next_k(self):
+        code = sp_keys(stranger_seed())
+        raw = send_request("p2wpkh", [code + (None,), code + (None,)])
+        p, _ = parsed_send(raw)
+        expected = expected_send_scripts(raw)
+        assert [out.script_pubkey.data for out in p.outputs] == [expected[0], expected[1]]
+        assert p.outputs[0].script_pubkey.data != p.outputs[1].script_pubkey.data
+
+    def test_change_to_our_own_label_zero_address_is_change(self):
+        scan, spend = change_code()
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,), (scan, spend, 0)])
+        _, parser = parsed_send(raw)
+        assert [r["change"] for r in parser.silent_payment_recipients] == [False, True]
+        assert parser.silent_payment_recipients[1]["address"] == silent_payments._bech32m(
+            "tsp", scan + spend)
+
+    def test_our_scan_key_without_the_label_zero_key_is_not_change(self):
+        """A claim of change is checked against both keys, not the scan key alone."""
+        scan, _ = change_code()
+        spend = sp_keys()[1]
+        raw = send_request("p2wpkh", [(scan, spend, 0)])
+        _, parser = parsed_send(raw)
+        assert parser.silent_payment_recipients[0]["change"] is False
+
+    def test_a_label_on_someone_elses_code_is_not_change(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (0,)])
+        _, parser = parsed_send(raw)
+        assert parser.silent_payment_recipients[0]["change"] is False
+
+    def test_an_ordinary_output_is_left_alone(self):
+        ordinary = script.p2wpkh(ec.PrivateKey(bytes.fromhex("42" * 32)).get_public_key()).data
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)],
+                           ordinary_outputs=[(5_000, ordinary)])
+        p, parser = parsed_send(raw)
+        assert p.outputs[1].script_pubkey.data == ordinary
+        assert len(parser.silent_payment_recipients) == 1
+
+    def test_a_matching_script_already_in_the_request_is_accepted(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        expected = expected_send_scripts(raw)[0]
+        maps = raw_maps(raw)
+        request = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        filled = bytearray(request)
+        # rewrite the output map with its script, as a coordinator that computed it would
+        head = request[:request.index(maps[2][b"\x09"]) - 3]
+        filled = bytearray(head) + write_map({
+            b"\x03": (10_000).to_bytes(8, "little"),
+            b"\x04": expected,
+            b"\x09": maps[2][b"\x09"],
+        })
+        p, _ = parsed_send(bytes(filled))
+        assert p.outputs[0].script_pubkey.data == expected
+
+
+def undo_send_changes(response: bytes, request: bytes) -> bytes:
+    """
+    The response with everything BIP-375 lets this device add or change taken back
+    out: the signatures, each sighash type, share, proof and output script the
+    request did not carry, and the modifiable flags as they came in.
+
+    What is left must be the request, byte for byte, or the device changed something
+    it was not entitled to.
+    """
+    request_maps = raw_maps(request)
+    inputs = int(request_maps[0][b"\x04"][0])
+    global_before = request_maps[0].get(b"\x06")
+    out = bytearray(response[:5])
+    stream = BytesIO(response[5:])
+    index = 0
+    while stream.tell() < len(response) - 5:
+        start = stream.tell()
+        key = stream.read(compact.read_from(stream))
+        if not key:
+            out += response[5 + start:5 + stream.tell()]
+            index += 1
+            continue
+        value = stream.read(compact.read_from(stream))
+        record = response[5 + start:5 + stream.tell()]
+        if index == 0:
+            if key[0] in silent_payments.SEND_KEY_TYPES["global"] and key not in request_maps[0]:
+                continue
+            if key == b"\x06":
+                if global_before is None:
+                    continue
+                record = (compact.to_bytes(len(key)) + key
+                          + compact.to_bytes(len(global_before)) + global_before)
+        elif 1 <= index <= inputs:
+            if key == b"\x03" and b"\x03" in request_maps[index]:
+                pass
+            elif key[0] in (0x13, 0x02, 0x03):
+                continue
+        elif key == b"\x04" and b"\x04" not in request_maps[index]:
+            continue
+        out += record
+    return bytes(out)
+
+
+def signed_send(kind: str = "p2wpkh", recipients=None, seed=None, **kwargs) -> tuple:
+    """A prepared and signed request, as (request bytes, psbt, response bytes)."""
+    seed = seed or abandon_seed()
+    recipients = recipients or [sp_keys(stranger_seed()) + (None,)]
+    raw = send_request(kind, recipients, seed=seed, **kwargs)
+    p, _ = parsed_send(raw, seed=seed)
+    silent_payments.sign_send_inputs(p, seed, TESTNET)
+    return raw, p, silent_payments.psbt_bytes(p)
+
+
+class TestSendSigning:
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_the_response_is_the_request_plus_only_what_is_allowed(self, kind):
+        raw, p, signed = signed_send(kind)
+        assert signed != raw
+        assert undo_send_changes(signed, raw) == raw
+        assert PSBTParser.sig_count(p) == 1
+
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_every_input_is_signed_with_sighash_all(self, kind):
+        raw, p, signed = signed_send(kind, inputs=2)
+        maps = raw_maps(signed)
+        for i in (1, 2):
+            assert maps[i][b"\x03"] == (0x01).to_bytes(4, "little")
+        assert PSBTParser.sig_count(p) == 2
+
+    def test_a_taproot_signature_is_65_bytes_and_verifies(self):
+        raw, p, signed = signed_send("p2tr")
+        signature = raw_maps(signed)[1][b"\x13"]
+        assert len(signature) == 65 and signature[64] == 0x01
+        reparsed = PSBT.parse(signed)
+        message = reparsed.sighash(0, sighash=SIGHASH.ALL)
+        assert message != reparsed.sighash(0, sighash=SIGHASH.DEFAULT)
+        output_key = reparsed.inputs[0].utxo.script_pubkey.data[2:]
+        assert bip340_verify(output_key, message, signature[:64])
+
+    @pytest.mark.parametrize("kind", ["p2wpkh", "p2sh-p2wpkh", "p2pkh"])
+    def test_an_ordinary_signature_is_a_partial_sig_ending_in_01(self, kind):
+        raw, p, signed = signed_send(kind)
+        records = [(k, v) for k, v in raw_maps(signed)[1].items() if k[0] == 0x02]
+        assert len(records) == 1
+        (key, signature), = records
+        assert len(key) == 34 and signature[-1] == 0x01
+        reparsed = PSBT.parse(signed)
+        message = reparsed.sighash(0, sighash=SIGHASH.ALL)
+        assert ec.PublicKey.parse(key[1:]).verify(ec.Signature.parse(signature[:-1]), message)
+        assert b"\x13" not in raw_maps(signed)[1]
+
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_the_response_is_never_finalized(self, kind):
+        """
+        embit's sign_with() writes a key-path Taproot signature into
+        PSBT_IN_FINAL_SCRIPTWITNESS, which is the coordinator's field, so a send does
+        not go through it and no input comes back finalized.
+        """
+        raw = send_request(kind, [sp_keys(stranger_seed()) + (None,)])
+        p, _ = parsed_send(raw)
+        original = PSBT.sign_with
+        try:
+            PSBT.sign_with = MagicMock(side_effect=AssertionError("sign_with()"))
+            silent_payments.sign_send_inputs(p, abandon_seed(), TESTNET)
+        finally:
+            PSBT.sign_with = original
+        signed = silent_payments.psbt_bytes(p)
+        assert all(key not in raw_maps(signed)[1] for key in (b"\x07", b"\x08"))
+        assert PSBT.parse(signed).inputs[0].final_scriptwitness is None
+
+    def test_signing_leaves_the_psbt_alone_when_an_input_is_not_ours(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        p, _ = parsed_send(raw)
+        before = silent_payments.psbt_bytes(p)
+        p.inputs[0].bip32_derivations.clear()
+        with pytest.raises(ValueError):
+            silent_payments.sign_send_inputs(p, abandon_seed(), TESTNET)
+        assert silent_payments.psbt_bytes(p) == before
+        assert PSBTParser.sig_count(p) == 0
+
+    def test_a_signed_response_cannot_be_signed_again(self):
+        raw, p, signed = signed_send("p2tr")
+        assert_refused(parse_kept(signed), RejectCode.UNSUPPORTED_SILENT_PAYMENT,
+                       match="already signed")
+
+    def test_the_change_output_is_signed_like_any_other(self):
+        scan, spend = change_code()
+        raw, p, signed = signed_send(
+            "p2wpkh", [sp_keys(stranger_seed()) + (None,), (scan, spend, 0)])
+        assert undo_send_changes(signed, raw) == raw
+        assert len([m for m in raw_maps(signed)[2:] if b"\x04" in m]) == 2
+
+
+def refuse_send(raw: bytes, code: str, match: str = None, seed=None):
+    with pytest.raises(InvalidPSBTError, match=match) as e:
+        PSBTParser(parse_kept(raw), seed=seed or abandon_seed(), network=TESTNET)
+    assert e.value.code == code
+    return e.value
+
+
+class TestSendRefusals:
+    def test_an_input_of_another_wallet(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)], seed=stranger_seed())
+        refuse_send(raw, RejectCode.FOREIGN_SILENT_PAYMENT, match="another wallet signs")
+
+    def test_an_input_whose_derivation_does_not_give_the_prevout(self):
+        """The prevout is what the check is against, not the derivation on its own."""
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        maps = raw_maps(raw)
+        other = ec.PrivateKey(bytes.fromhex("5e" * 32)).get_public_key()
+        stolen = b"\x00\x14" + hashlib.new("ripemd160", hashlib.sha256(other.sec()).digest()).digest()
+        maps[1][b"\x01"] = maps[1][b"\x01"][:8] + compact.to_bytes(len(stolen)) + stolen
+        refuse_send(rebuild(maps), RejectCode.FOREIGN_SILENT_PAYMENT, match="another wallet signs")
+
+    def test_a_script_path_taproot_input(self):
+        seed = abandon_seed()
+        root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(" ".join(ABANDON)))
+        key = root.derive(SEND_PATHS["p2tr"]).key
+        leaf = bytes.fromhex("77" * 32)
+        raw = send_request("p2tr", [sp_keys(stranger_seed()) + (None,)], extra_input_fields={
+            b"\x16" + key.xonly(): (compact.to_bytes(1) + leaf
+                                    + path_field(root.my_fingerprint,
+                                                 bip32.parse_path(SEND_PATHS["p2tr"]))),
+        })
+        refuse_send(raw, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="not a type")
+
+    def test_a_taproot_leaf_script(self):
+        """A leaf script means the output key may be spent through a script path."""
+        raw = send_request("p2tr", [sp_keys(stranger_seed()) + (None,)],
+                           extra_input_fields={b"\x15" + b"\x01" * 33: b"\x51"})
+        refuse_send(raw, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="not a type")
+
+    def test_an_ineligible_input_type(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        maps = raw_maps(raw)
+        p2wsh = b"\x00\x20" + bytes.fromhex("9a" * 32)
+        maps[1][b"\x01"] = maps[1][b"\x01"][:8] + compact.to_bytes(len(p2wsh)) + p2wsh
+        refuse_send(rebuild(maps), RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="not a type")
+
+    def test_inputs_of_more_than_one_kind(self):
+        first = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)], inputs=2)
+        taproot = raw_maps(send_request("p2tr", [sp_keys(stranger_seed()) + (None,)]))[1]
+        maps = raw_maps(first)
+        refuse_send(rebuild([maps[0], maps[1], taproot, maps[3]]), RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="more than one kind")
+
+    def test_another_signers_ecdh_share(self):
+        scan = sp_keys(stranger_seed())[0]
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)],
+                           extra_input_fields={b"\x1d" + scan: b"\x02" + bytes(32)})
+        refuse_send(raw, RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="another signer's ECDH share")
+
+    @pytest.mark.parametrize("sighash", [0x00, 0x02, 0x03, 0x81])
+    def test_a_sighash_that_is_not_all(self, sighash):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)], sighash=sighash)
+        refuse_send(raw, RejectCode.UNSUPPORTED_SIGHASH, match="not SIGHASH_ALL")
+
+    def test_an_explicit_sighash_all_is_accepted(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)], sighash=0x01)
+        p, parser = parsed_send(raw)
+        assert p.outputs[0].script_pubkey.data == expected_send_scripts(raw)[0]
+
+    def test_an_output_script_that_pays_somewhere_else(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        maps = raw_maps(raw)
+        elsewhere = b"\x51\x20" + bytes.fromhex("11" * 32)
+        maps[2] = {b"\x03": maps[2][b"\x03"], b"\x04": elsewhere, b"\x09": maps[2][b"\x09"]}
+        refuse_send(rebuild(maps), RejectCode.UNSUPPORTED_SILENT_PAYMENT,
+                    match="already pays somewhere else")
+
+    def test_an_ecdh_share_these_inputs_do_not_give(self):
+        scan = sp_keys(stranger_seed())[0]
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        maps = raw_maps(raw)
+        maps[0][b"\x07" + scan] = ec.PrivateKey(bytes.fromhex("31" * 32)).get_public_key().sec()
+        refuse_send(rebuild(maps), RejectCode.UNSUPPORTED_SILENT_PAYMENT,
+                    match="not the one these inputs give")
+
+    def test_a_dleq_proof_that_does_not_hold(self):
+        scan = sp_keys(stranger_seed())[0]
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        p, _ = parsed_send(raw)
+        share = p.unknown[b"\x07" + scan]
+        maps = raw_maps(raw)
+        maps[0][b"\x07" + scan] = share
+        maps[0][b"\x08" + scan] = bytes(64)
+        refuse_send(rebuild(maps), RejectCode.UNSUPPORTED_SILENT_PAYMENT,
+                    match="does not hold")
+
+    def test_a_global_field_of_its_own(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        maps = raw_maps(raw)
+        maps[0][b"\xfc\x04kiss"] = b"\x01"
+        refuse_send(rebuild(maps), RejectCode.UNSUPPORTED_SILENT_PAYMENT,
+                    match="global field of its own")
+
+    def test_a_v0_psbt(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        maps = raw_maps(raw)
+        del maps[0][b"\xfb"]
+        refuse_send(rebuild(maps), RejectCode.UNSUPPORTED_SILENT_PAYMENT, match="v2 PSBT")
+
+    def test_a_psbt_whose_own_bytes_were_not_kept(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        with pytest.raises(InvalidPSBTError, match="as received") as e:
+            PSBTParser(PSBT.parse(raw), seed=abandon_seed(), network=TESTNET)
+        assert e.value.code == RejectCode.UNSUPPORTED_SILENT_PAYMENT
+
+    def test_a_seed_that_has_no_silent_payments_account(self):
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        with pytest.raises(InvalidPSBTError, match="Silent Payment") as e:
+            PSBTParser(parse_kept(raw), seed=abandon_seed(), network=REGTEST)
+        assert e.value.code == RejectCode.UNSUPPORTED_SILENT_PAYMENT
+
 
 BIP352_SENDING = data_file("bip352_sending_vectors.json")
+BIP375_VECTORS = data_file("bip375_psbt_vectors.json")
+
+# BIP-375's own vectors assign k by output index, while its text sorts the codes
+# lexicographically. The two differ only when one scan key has more than one spend key,
+# which this device refuses for that reason (see TestSendRefusals).
+BIP375_SHARED_SCAN_KEY = "label=3"
 
 
 def sending_cases(with_outputs=True) -> list:
@@ -1359,6 +1901,74 @@ def sending_cases(with_outputs=True) -> list:
         if has == with_outputs:
             cases.append(case)
     return cases
+
+
+def hash160(data: bytes) -> bytes:
+    return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
+
+
+# BIP-341's NUMS point H. BIP-352 skips a Taproot input whose *internal* key is H,
+# which the spender shows in the control block of a script-path spend; the output key
+# is H tweaked by the merkle root, not H itself.
+NUMS_POINT = bytes.fromhex("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+
+
+def taproot_internal_key(inp) -> bytes:
+    """
+    The x-only internal key an input states: PSBT_IN_TAP_INTERNAL_KEY, or the one in
+    the control block of a leaf script (PSBT_IN_TAP_LEAF_SCRIPT, whose key is the
+    control block: a leaf version byte, then the internal key). None if it states
+    neither.
+    """
+    if inp.taproot_internal_key is not None:
+        return inp.taproot_internal_key.xonly()
+    for key in inp.taproot_scripts:
+        if len(key) >= 33:
+            return bytes(key[1:33])
+    return None
+
+
+def vector_input_key(inp):
+    """
+    What an input of a BIP-375 vector contributes to the shared secret, as
+    (eligible, key): BIP-352's four types only, the NUMS exception applied to the
+    internal key, and P2SH only when it wraps P2WPKH. `key` is None for an eligible
+    input the vector never states a key for.
+
+    A Taproot prevout gives its own output key, as BIP-352 says. For the other types
+    it is the key the input declares, because these vectors' P2WPKH and P2SH prevouts
+    do not hash to their own declared keys (hash160(02c817bb...) is 1e2ad787..., the
+    prevout is 0014229a72d3...) -- which is also why this device refuses these vectors
+    outright: see TestSendRefusals for the prevout check on requests built here.
+    """
+    utxo = inp.utxo if (inp.witness_utxo or inp.non_witness_utxo) else None
+    if utxo is None:
+        return False, None
+    data = utxo.script_pubkey.data
+    declared = [pub for pub in inp.bip32_derivations]
+    declared += [ec.PublicKey.parse(b"\x02" + pub.xonly()) for pub in inp.taproot_bip32_derivations]
+    if len(data) == 34 and data[:2] == b"\x51\x20":
+        internal = taproot_internal_key(inp)
+        if internal == NUMS_POINT:
+            # BIP-352's exception: a script-path spend under H contributes nothing.
+            return False, None
+        if internal is None and data[2:] == NUMS_POINT:
+            # This file's own shorthand for that case: the vector states no control
+            # block and puts H in the output key instead. Kept, and named, rather
+            # than left looking like the rule itself.
+            return False, None
+        return True, ec.PublicKey.parse(b"\x02" + data[2:])
+    if len(data) == 22 and data[:2] == b"\x00\x14":
+        return True, declared[0] if declared else None
+    if len(data) == 23 and data[:2] == b"\xa9\x14":
+        redeem = inp.redeem_script.data if inp.redeem_script else b""
+        if len(redeem) != 22 or redeem[:2] != b"\x00\x14":
+            # A P2SH input that wraps anything but P2WPKH, e.g. multisig.
+            return False, None
+        return True, declared[0] if declared else None
+    if len(data) == 25 and data[:3] == b"\x76\xa9\x14" and data[23:] == b"\x88\xac":
+        return True, declared[0] if declared else None
+    return False, None
 
 
 class TestBip352SendingVectors:
@@ -1426,9 +2036,295 @@ class TestBip352SendingVectors:
         what a receiver has to scan. The vector's own recipient list is generated rather
         than written out, so the limit is exercised directly.
         """
-        scan = ec.PrivateKey(bytes.fromhex("6b" * 32)).get_public_key().sec()
+        scan = sp_keys(stranger_seed())[0]
         assert any("K_max" in case["comment"] for case in BIP352_SENDING)
         codes = [(scan, i.to_bytes(33, "big")) for i in range(silent_payments.K_MAX + 1)]
         with pytest.raises(ValueError, match="too many payments"):
             silent_payments.code_order(codes)
         silent_payments.code_order(codes[:-1])
+
+
+class TestBip375Vectors:
+    """
+    BIP-375's own PSBT vectors, as bitcoin/bips publishes them. Their inputs belong to
+    the vector generator rather than to a seed here, so what they prove is the
+    derivation and the refusals, not this device completing them.
+    """
+    @pytest.mark.parametrize("entry", BIP375_VECTORS["valid"],
+                             ids=lambda entry: entry["description"][:48])
+    def test_valid_vectors_parse(self, entry):
+        p = PSBT.parse(a2b_base64(entry["psbt"]))
+        assert p.version == 2
+        assert silent_payments.has_send_fields(p) or p.outputs
+
+    @pytest.mark.parametrize("entry", [e for e in BIP375_VECTORS["valid"]
+                                       if BIP375_SHARED_SCAN_KEY not in e["description"]],
+                             ids=lambda entry: entry["description"][:48])
+    def test_completed_vectors_match_our_derivation(self, entry):
+        """
+        Every script a completed vector carries must be the one this helper computes
+        from that vector's own inputs, shares and codes.
+        """
+        p = PSBT.parse(a2b_base64(entry["psbt"]))
+        recipients = [(i, out.unknown[b"\x09"]) for i, out in enumerate(p.outputs)
+                      if b"\x09" in out.unknown]
+        if not all(p.outputs[i].script_pubkey for i, _ in recipients):
+            pytest.skip("not completed: the signer's part is still missing")
+
+        eligible = [inp for inp in p.inputs if vector_input_key(inp)[0]]
+        keys = [vector_input_key(inp)[1] for inp in eligible]
+        if not eligible:
+            pytest.skip("no input of one of BIP-352's four types, so there is no sum")
+        if any(key is None for key in keys):
+            pytest.skip("an eligible input states no public key")
+        a_point = silent_payments._lincomb([(pub, 1) for pub in keys])
+        outpoints = [bytes(inp.txid)[::-1] + inp.vout.to_bytes(4, "little") for inp in p.inputs]
+        hash_of_inputs = silent_payments.input_hash(outpoints, a_point)
+
+        def share_for(scan: bytes):
+            whole = p.unknown.get(b"\x07" + scan)
+            if whole:
+                return ec.PublicKey.parse(whole)
+            # Only an eligible input's share belongs in the sum, exactly as only its
+            # key belongs in A.
+            parts = [ec.PublicKey.parse(inp.unknown[b"\x1d" + scan]) for inp in eligible
+                     if b"\x1d" + scan in inp.unknown]
+            return silent_payments._lincomb([(part, 1) for part in parts])
+
+        codes = [(info[:33], info[33:]) for _, info in recipients]
+        for (index, info), k in zip(recipients, silent_payments.code_order(codes)):
+            computed = silent_payments.output_script(
+                share_for(info[:33]), ec.PublicKey.parse(info[33:]), hash_of_inputs, k)
+            assert computed == p.outputs[index].script_pubkey.data
+
+    @pytest.mark.parametrize("entry", BIP375_VECTORS["invalid"],
+                             ids=lambda entry: entry["description"][:48])
+    def test_invalid_vectors_are_refused(self, entry):
+        with pytest.raises((InvalidPSBTError, ValueError)):
+            PSBTParser(parse_kept(a2b_base64(entry["psbt"])), seed=abandon_seed(),
+                       network=TESTNET)
+
+    @pytest.mark.parametrize("fragment, match", [
+        ("missing PSBT_OUT_SP_V0_INFO field when PSBT_OUT_SP_V0_LABEL", "label but no keys"),
+        ("incorrect byte length for PSBT_OUT_SP_V0_INFO", "malformed Silent Payment field"),
+        # These two vectors arrive signed, and being signed already is the first thing
+        # wrong with them as a request to this device.
+        ("incorrect byte length for PSBT_IN_SP_ECDH_SHARE", "already signed"),
+        ("incorrect byte length for PSBT_IN_SP_DLEQ", "already signed"),
+    ])
+    def test_malformed_fields_are_refused_for_their_own_reason(self, fragment, match):
+        """
+        These are refused on their fields, before this seed's keys are read: a request
+        this device cannot act on should say so, not report the wrong wallet.
+        """
+        entry = next(e for e in BIP375_VECTORS["invalid"] if fragment in e["description"])
+        with pytest.raises(InvalidPSBTError, match=match) as e:
+            PSBTParser(parse_kept(a2b_base64(entry["psbt"])), seed=abandon_seed(),
+                       network=TESTNET)
+        assert e.value.code == RejectCode.UNSUPPORTED_SILENT_PAYMENT
+
+    def test_the_shared_scan_key_vector_disagrees_with_the_text(self):
+        """
+        Two codes sharing a scan key are the one case where BIP-375's text and its own
+        vectors part company: the text sorts the codes to fix k, this vector assigns k
+        by output index, and the scripts differ. This device follows the text, as
+        Sparrow does, so its answer for this vector is the other one. If the vector or
+        the text changes, this test is what says so.
+        """
+        entry = next(e for e in BIP375_VECTORS["valid"]
+                     if BIP375_SHARED_SCAN_KEY in e["description"])
+        p = PSBT.parse(a2b_base64(entry["psbt"]))
+        recipients = [(i, out.unknown[b"\x09"]) for i, out in enumerate(p.outputs)
+                      if b"\x09" in out.unknown]
+        eligible = [inp for inp in p.inputs if vector_input_key(inp)[0]]
+        a_point = silent_payments._lincomb([(vector_input_key(inp)[1], 1) for inp in eligible])
+        outpoints = [bytes(inp.txid)[::-1] + inp.vout.to_bytes(4, "little") for inp in p.inputs]
+        hash_of_inputs = silent_payments.input_hash(outpoints, a_point)
+        codes = [(info[:33], info[33:]) for _, info in recipients]
+        scan = codes[0][0]
+        share = silent_payments._lincomb(
+            [(ec.PublicKey.parse(inp.unknown[b"\x1d" + scan]), 1) for inp in eligible
+             if b"\x1d" + scan in inp.unknown])
+
+        def scripts(ks):
+            return [silent_payments.output_script(share, ec.PublicKey.parse(spend),
+                                                 hash_of_inputs, k)
+                    for (_scan, spend), k in zip(codes, ks)]
+
+        in_the_vector = [p.outputs[i].script_pubkey.data for i, _ in recipients]
+        assert scripts(range(len(codes))) == in_the_vector
+        assert scripts(silent_payments.code_order(codes)) != in_the_vector
+
+
+def send_secrets(kind: str, raw: bytes) -> list:
+    """Every secret a send derives: each input's key, and their sum a."""
+    root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(" ".join(ABANDON)))
+    p = PSBT.parse(raw)
+    keys = []
+    for _inp in p.inputs:
+        derived = root.derive(SEND_PATHS[kind]).key
+        keys.append(derived.taproot_tweak(b"").secret if kind == "p2tr" else derived.secret)
+    secrets = [key.hex() for key in keys]
+    secrets.append(silent_payments.secret_sum(
+        [silent_payments.even_y_secret(key) if kind == "p2tr" else key for key in keys]).hex())
+    return secrets
+
+
+def sp_send_request(tweak: int = 0x02, recipients: list = None, modifiable: int = 0x03,
+                    sighash: int = None) -> bytes:
+    """
+    A request that pays a Silent Payment address out of a received Silent Payment
+    coin: BIP-376 spend fields on the input, BIP-375 fields on the output.
+    """
+    recipients = recipients or [sp_keys(stranger_seed()) + (None,)]
+    d = (b_spend() + tweak) % SECP_N
+    spend_pub = ec.PrivateKey(b_spend().to_bytes(32, "big")).get_public_key().sec()
+    root = bip32.HDKey.from_seed(bip39.mnemonic_to_seed(" ".join(ABANDON)))
+    path = [0x80000000 + 352, 0x80000001, 0x80000000, 0x80000000, 0]
+    spk = b"\x51\x20" + xonly_of(d)
+
+    global_fields = {
+        b"\x02": (2).to_bytes(4, "little"),
+        b"\x04": compact.to_bytes(1),
+        b"\x05": compact.to_bytes(len(recipients)),
+        b"\xfb": (2).to_bytes(4, "little"),
+        b"\x06": bytes([modifiable]),
+    }
+    fields = {
+        b"\x01": (10_000).to_bytes(8, "little") + compact.to_bytes(len(spk)) + spk,
+        b"\x0e": bytes([0xCD]) * 32,
+        b"\x0f": (0).to_bytes(4, "little"),
+        b"\x10": (0xFFFFFFFE).to_bytes(4, "little"),
+        b"\x1f" + spend_pub: path_field(root.my_fingerprint, path),
+        b"\x20": tweak.to_bytes(32, "big"),
+    }
+    if sighash is not None:
+        fields[b"\x03"] = sighash.to_bytes(4, "little")
+    raw = bytearray(b"psbt\xff") + write_map(global_fields) + write_map(fields)
+    for scan, spend, label in recipients:
+        out = {b"\x03": (9_000).to_bytes(8, "little"), b"\x09": scan + spend}
+        if label is not None:
+            out[b"\x0a"] = label.to_bytes(4, "little")
+        raw += write_map(out)
+    return bytes(raw)
+
+
+def input_records(data: bytes, index: int = 1) -> list:
+    """One map's records in order, so a repeated key is visible."""
+    return [(key, value) for key, value, _s, _e in silent_payments._maps(data)[index][2]]
+
+
+class TestSendRoundTwo:
+    """The four defects the second review round found, each with its own case."""
+
+    def test_an_explicit_sighash_all_is_not_written_twice(self):
+        """
+        A request may state SIGHASH_ALL itself. Writing our own alongside it makes a
+        psbt with two PSBT_IN_SIGHASH_TYPE records, which no parser will read back.
+        """
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)], sighash=0x01)
+        p, _ = parsed_send(raw)
+        silent_payments.sign_send_inputs(p, abandon_seed(), TESTNET)
+        signed = silent_payments.psbt_bytes(p)
+
+        assert [key for key, _ in input_records(signed)].count(b"\x03") == 1
+        assert PSBT.parse(signed).inputs[0].sighash_type == 0x01
+        assert undo_send_changes(signed, raw) == raw
+
+    def test_a_send_from_a_received_silent_payment_coin(self):
+        """
+        Spending a Silent Payment coin to a Silent Payment address is one transaction,
+        not two: the send's rules apply to it, not the spend-only ones (SIGHASH_ALL
+        rather than DEFAULT, and flags this device is the one to clear).
+        """
+        raw = sp_send_request()
+        p, parser = parsed_send(raw)
+        assert parser.silent_payment_send
+        assert all(parser.silent_payment_inputs)
+        assert p.unknown[b"\x06"] == b"\x00"
+        assert p.outputs[0].script_pubkey.data.startswith(b"\x51\x20")
+
+        silent_payments.sign_send_inputs(p, abandon_seed(), TESTNET)
+        signed = silent_payments.psbt_bytes(p)
+        assert undo_send_changes(signed, raw) == raw
+        signature = dict(input_records(signed))[b"\x13"]
+        assert len(signature) == 65 and signature[64] == 0x01
+        reparsed = PSBT.parse(signed)
+        message = reparsed.sighash(0, sighash=SIGHASH.ALL)
+        assert bip340_verify(reparsed.inputs[0].utxo.script_pubkey.data[2:], message,
+                             signature[:64])
+
+    def test_a_spend_still_needs_sighash_default(self):
+        """The spend-only rules stay in force for a spend that pays no one silently."""
+        p = sp_psbt("01-sp-spend-1in")
+        p.inputs[0].sighash_type = 0x01
+        assert_refused(p, RejectCode.UNSUPPORTED_SIGHASH, match="not SIGHASH_DEFAULT")
+
+    def test_a_valid_supplied_dleq_proof_is_kept(self):
+        """
+        A proof that already holds is left alone. Replacing it with our own would be a
+        change the export is right to refuse, and there is nothing to gain by it.
+        """
+        scan = sp_keys(stranger_seed())[0]
+        raw = send_request("p2wpkh", [sp_keys(stranger_seed()) + (None,)])
+        prepared, _ = parsed_send(raw)
+        share, proof = prepared.unknown[b"\x07" + scan], prepared.unknown[b"\x08" + scan]
+
+        maps = raw_maps(raw)
+        maps[0][b"\x07" + scan] = share
+        maps[0][b"\x08" + scan] = proof
+        supplied = rebuild(maps)
+
+        p, _ = parsed_send(supplied)
+        assert p.unknown[b"\x08" + scan] == proof
+        silent_payments.sign_send_inputs(p, abandon_seed(), TESTNET)
+        signed = silent_payments.psbt_bytes(p)
+        assert undo_send_changes(signed, supplied) == supplied
+        assert dict(input_records(signed))[b"\x03"] == (1).to_bytes(4, "little")
+
+
+class TestSharedScanKeyOrdering:
+    """
+    Two codes with one scan key is the case where BIP-375's text and its own published
+    vectors part company: the text sorts the codes to fix k, the vectors go by output
+    index. This device follows the text, and so does Sparrow -- drongo sorts each scan
+    key's group by the serialized code -- which is what a wallet paying itself while
+    its change shares that scan key depends on.
+    """
+    def test_k_follows_the_sorted_codes_not_the_output_order(self):
+        scan, spend = sp_keys(stranger_seed())
+        labeled = labeled_spend_key(stranger_seed(), 3)
+        first, second = sorted([spend, labeled])
+        raw = send_request("p2wpkh", [(scan, labeled, 3), (scan, spend, None)])
+        p, parser = parsed_send(raw)
+
+        a = bytes.fromhex(send_secrets("p2wpkh", raw)[-1])
+        share = silent_payments.ecdh_share(a, ec.PublicKey.parse(scan))
+        outpoints = [bytes(inp.txid)[::-1] + inp.vout.to_bytes(4, "little") for inp in p.inputs]
+        hash_of_inputs = silent_payments.input_hash(outpoints, ec.PrivateKey(a).get_public_key())
+        expected = {
+            first: silent_payments.output_script(share, ec.PublicKey.parse(first), hash_of_inputs, 0),
+            second: silent_payments.output_script(share, ec.PublicKey.parse(second), hash_of_inputs, 1),
+        }
+        assert p.outputs[0].script_pubkey.data == expected[labeled]
+        assert p.outputs[1].script_pubkey.data == expected[spend]
+        assert p.outputs[0].script_pubkey.data != p.outputs[1].script_pubkey.data
+        assert [r["change"] for r in parser.silent_payment_recipients] == [False, False]
+
+    def test_our_own_change_beside_a_payment_to_ourselves(self):
+        """
+        The Sparrow shape: a self-send to this wallet's own address with label-0 change
+        back to it. Both codes share this seed's scan key, so this is the case the
+        ordering decides, and the device has to sign it rather than refuse.
+        """
+        scan, spend = sp_keys()
+        change_scan, change_spend = change_code()
+        assert scan == change_scan
+        raw = send_request("p2wpkh", [(scan, spend, None), (change_scan, change_spend, 0)])
+        p, parser = parsed_send(raw)
+        assert [r["change"] for r in parser.silent_payment_recipients] == [False, True]
+
+        silent_payments.sign_send_inputs(p, abandon_seed(), TESTNET)
+        signed = silent_payments.psbt_bytes(p)
+        assert undo_send_changes(signed, raw) == raw
+        assert PSBTParser.sig_count(PSBT.parse(signed)) == 1

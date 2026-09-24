@@ -9,10 +9,12 @@ output key derived from it, never leaves this module.
 TODO: move this into embit once embit ships Silent Payments support (0.8.0 has
 none).
 """
+import os
 from io import BytesIO
 
 from embit import bech32, compact, ec, hashes
 from embit.bip32 import HARDENED_INDEX as H
+from embit.script import Script
 from embit.transaction import SIGHASH
 from embit.util import key as pykey, secp256k1
 
@@ -491,6 +493,12 @@ def code_order(codes: list) -> list:
     The k of each output, from its (scan key, spend key) pair, per BIP-375: codes
     sharing a scan key are sorted lexicographically, and codes sharing both keys by
     output index. Output order alone is not the ordering.
+
+    Sparrow does the same (drongo's SilentPaymentUtils sorts each scan key's group by
+    the serialized code, a stable sort keeping output order within one code), which
+    matters because a wallet's own change shares its scan key with anything else it
+    pays itself. BIP-375's published vectors go by output index instead; see
+    TestBip375Vectors for what that costs.
     """
     groups = {}
     for index, (scan, spend) in enumerate(codes):
@@ -502,3 +510,388 @@ def code_order(codes: list) -> list:
         for k, (_, index) in enumerate(sorted(members)):
             order[index] = k
     return [order[index] for index in range(len(codes))]
+
+
+def send_recipients(psbt) -> list:
+    """
+    Each Silent Payment output as (index, scan key, spend key, label): a 66-byte
+    PSBT_OUT_SP_V0_INFO of two compressed keys, filed under the key type alone, and an
+    optional 4-byte PSBT_OUT_SP_V0_LABEL that needs an info to belong to.
+
+    Raises ValueError for anything else, including a label on an ordinary output.
+    """
+    info_type, label_type = SEND_KEY_TYPES["output"]
+    recipients = []
+    for index, out in enumerate(psbt.outputs):
+        infos = [(k, v) for k, v in out.unknown.items() if k[0] == info_type]
+        labels = [(k, v) for k, v in out.unknown.items() if k[0] == label_type]
+        if len(infos) > 1 or len(labels) > 1:
+            raise ValueError("output %d repeats a Silent Payment field" % index)
+        if not infos:
+            if labels:
+                raise ValueError("output %d has a Silent Payment label but no keys" % index)
+            continue
+        (key, info), = infos
+        if len(key) != 1 or len(info) != 66:
+            raise ValueError("output %d has a malformed Silent Payment field" % index)
+        if labels:
+            (label_key, label), = labels
+            if len(label_key) != 1 or len(label) != 4:
+                raise ValueError("output %d has a malformed Silent Payment label" % index)
+        else:
+            label = None
+        scan, spend = _point(info[:33]), _point(info[33:])
+        recipients.append((index, scan, spend, label))
+    return recipients
+
+
+def _input_kind(inp) -> str:
+    """
+    Which of BIP-352's four eligible input types this input spends, or "" for anything
+    else. A Taproot input that is not a bare key-path spend is not one of them: a leaf
+    script, a script signature or a derivation naming leaves all mean the output key
+    may be spent through a script, which this signer does not handle.
+    """
+    utxo = inp.utxo if (inp.witness_utxo or inp.non_witness_utxo) else None
+    if utxo is None:
+        return ""
+    data = utxo.script_pubkey.data
+    if len(data) == 34 and data[0] == 0x51 and data[1] == 0x20:
+        if inp.taproot_scripts or inp.taproot_sigs or inp.taproot_merkle_root:
+            return ""
+        if any(leaves for leaves, _ in inp.taproot_bip32_derivations.values()):
+            return ""
+        return "p2tr"
+    if len(data) == 22 and data[0] == 0x00 and data[1] == 0x14:
+        return "p2wpkh"
+    if len(data) == 23 and data[0] == 0xA9 and data[1] == 0x14 and data[22] == 0x87:
+        return "p2sh-p2wpkh"
+    if (len(data) == 25 and data[:3] == b"\x76\xa9\x14" and data[23:] == b"\x88\xac"):
+        return "p2pkh"
+    return ""
+
+
+def _derived_key(root, inp, kind: str):
+    """
+    The private key an ordinary input names, derived from this seed and proven to be
+    the one that can spend the prevout. Raises ValueError otherwise.
+
+    The prevout is what the check is against, never the derivation on its own: a
+    coordinator writes both, and only the prevout is what the chain will enforce.
+    """
+    if kind == "p2tr":
+        claims = [(pub, path) for pub, (leaves, path) in inp.taproot_bip32_derivations.items()]
+    else:
+        claims = list(inp.bip32_derivations.items())
+    mine = [(pub, path) for pub, path in claims if path.fingerprint == root.my_fingerprint]
+    if len(mine) != 1:
+        raise ValueError("needs exactly one derivation of this seed's")
+    pub, path = mine[0]
+    key = root.derive(path.derivation).key
+    utxo = inp.utxo
+    data = utxo.script_pubkey.data
+    if kind == "p2tr":
+        if key.xonly() != pub.xonly():
+            raise ValueError("derivation does not give the key it claims")
+        # BIP-86: the output key is the internal key tweaked with no script tree.
+        tweaked = key.taproot_tweak(b"")
+        if tweaked.xonly() != data[2:]:
+            raise ValueError("derivation does not give the Taproot output key")
+        return tweaked
+    if key.sec() != pub.sec():
+        raise ValueError("derivation does not give the key it claims")
+    pkh = hashes.hash160(key.sec())
+    if kind == "p2wpkh":
+        if data[2:] != pkh:
+            raise ValueError("derivation does not give the witness program")
+    elif kind == "p2sh-p2wpkh":
+        # P2SH commits to the redeem script, so both steps are checked: the redeem
+        # script must be this key's P2WPKH, and its hash the one in the prevout.
+        redeem = inp.redeem_script.data if inp.redeem_script else b""
+        if redeem != b"\x00\x14" + pkh:
+            raise ValueError("redeem script is not this key's P2WPKH")
+        if data[2:22] != hashes.hash160(redeem):
+            raise ValueError("redeem script is not the one the prevout commits to")
+    elif data[3:23] != pkh:
+        raise ValueError("derivation does not give the key hash")
+    return key
+
+
+def send_signing_keys(psbt, seed, network: str) -> list:
+    """
+    The (kind, key) of every input, each proven to spend its own prevout with this
+    seed's key. Raises ValueError as soon as one input is not this seed's, because an
+    input left out of the sum would make every Silent Payment output wrong.
+
+    The scope is one signer holding every input, all of one kind, or all BIP-376
+    Silent Payment inputs: a send needs the whole input sum, and a share from another
+    signer (PSBT_IN_SP_ECDH_SHARE) is a collaborative transaction this does not do.
+    """
+    root = _master_root(seed, network)
+    keys, kinds = [], set()
+    for i, inp in enumerate(psbt.inputs):
+        if is_spend_input(inp):
+            kinds.add("sp")
+            keys.append(("p2tr", spend_signing_key(seed, network, inp)))
+            continue
+        kind = _input_kind(inp)
+        if not kind:
+            raise ValueError("input %d is not a type Silent Payments can send from" % i)
+        try:
+            key = _derived_key(root, inp, kind)
+        except ValueError as e:
+            raise ValueError("input %d is not this seed's: %s" % (i, e))
+        kinds.add(kind)
+        keys.append((kind, key))
+    if len(kinds) > 1:
+        raise ValueError("inputs are of more than one kind")
+    return keys
+
+
+def _input_secrets(keys: list) -> list:
+    """Each input's BIP-352 key: a Taproot input contributes its even-Y output key."""
+    return [even_y_secret(key.secret) if kind == "p2tr" else key.secret for kind, key in keys]
+
+
+def _outpoints(psbt) -> list:
+    return [bytes(inp.txid)[::-1] + inp.vout.to_bytes(4, "little") for inp in psbt.inputs]
+
+
+def _label_zero_spend_key(seed, network: str) -> bytes:
+    """This wallet's change key: B_spend + hash_BIP0352/Label(b_scan || ser32(0))*G."""
+    scan, spend = _keys(seed, network)
+    tweak = hashes.tagged_hash("BIP0352/Label", scan.secret + (0).to_bytes(4, "big"))
+    changed = _lincomb([(_generator(), _scalar(tweak)), (spend.get_public_key(), 1)])
+    return changed.sec()
+
+
+def prepare_send(psbt, seed, network: str, randomness=None) -> list:
+    """
+    Complete a BIP-375 send in place, and sign nothing: prove every input is this
+    seed's, compute the ECDH share and DLEQ proof for each scan key, fill in every
+    PSBT_OUT_SCRIPT, and clear the Inputs/Outputs Modifiable flags.
+
+    Returns one entry per Silent Payment output, {index, address, change}, for the
+    review screens: the user checks the sp1... address they were given, not the
+    Taproot address computed from it.
+
+    Raises ValueError, which the parser turns into a refusal, and leaves the psbt as
+    it was: every value is computed before anything is written.
+    """
+    recipients = send_recipients(psbt)
+    if not recipients:
+        raise ValueError("no Silent Payment outputs")
+    share_type, dleq_type = SEND_KEY_TYPES["global"]
+    for i, inp in enumerate(psbt.inputs):
+        if _has_key_type(inp, SEND_KEY_TYPES["input"]):
+            raise ValueError("input %d carries another signer's ECDH share" % i)
+
+    groups = {}
+    for _, scan, spend, _label in recipients:
+        groups.setdefault(scan.sec(), set()).add(spend.sec())
+
+    keys = send_signing_keys(psbt, seed, network)
+    secret = secret_sum(_input_secrets(keys))
+    del keys
+    a_point = ec.PrivateKey(secret).get_public_key()
+    hash_of_inputs = input_hash(_outpoints(psbt), a_point)
+
+    shares, proofs = {}, {}
+    for scan_key in groups:
+        scan = _point(scan_key)
+        share = ecdh_share(secret, scan)
+        existing = psbt.unknown.get(bytes([share_type]) + scan_key)
+        if existing is not None and existing != share.sec():
+            raise ValueError("the ECDH share in this PSBT is not the one these inputs give")
+        given = psbt.unknown.get(bytes([dleq_type]) + scan_key)
+        if given is not None and not dleq_verify(a_point, scan, share, given):
+            raise ValueError("the DLEQ proof in this PSBT does not hold")
+        shares[scan_key] = share
+        # A proof that holds is left as it came: replacing it is a change to the
+        # request, and proving the same statement twice gains nothing.
+        proofs[scan_key] = given or dleq_prove(secret, scan, randomness or os.urandom(32))
+
+    order = code_order([(scan.sec(), spend.sec()) for _, scan, spend, _l in recipients])
+    scripts, change_key = {}, _label_zero_spend_key(seed, network)
+    our_scan = _keys(seed, network)[0].get_public_key().sec()
+    for (index, scan, spend, label), k in zip(recipients, order):
+        computed = output_script(shares[scan.sec()], spend, hash_of_inputs, k)
+        present = psbt.outputs[index].script_pubkey
+        if present is not None and len(present.data) and present.data != computed:
+            raise ValueError("output %d already pays somewhere else" % index)
+        scripts[index] = computed
+    del secret
+
+    for scan_key in shares:
+        psbt.unknown[bytes([share_type]) + scan_key] = shares[scan_key].sec()
+        psbt.unknown[bytes([dleq_type]) + scan_key] = proofs[scan_key]
+    for index, computed in scripts.items():
+        psbt.outputs[index].script_pubkey = Script(computed)
+    flags = psbt.unknown.get(GLOBAL_TX_MODIFIABLE)
+    if flags is not None:
+        psbt.unknown[GLOBAL_TX_MODIFIABLE] = bytes([flags[0] & ~0x03]) + flags[1:]
+
+    hrp = "sp" if network == SettingsConstants.MAINNET else "tsp"
+    return [{
+        "index": index,
+        "address": _bech32m(hrp, scan.sec() + spend.sec()),
+        "change": scan.sec() == our_scan and spend.sec() == change_key,
+        "label": None if label is None else int.from_bytes(label, "little"),
+    } for index, scan, spend, label in recipients]
+
+
+def _response_changes(psbt) -> tuple:
+    """
+    What preparation changed, as (global additions, global replacements, output
+    additions, the request's own input fields), checked against what BIP-375 lets a
+    signer change: an ECDH share or a
+    DLEQ proof added, the modifiable flags with bits cleared, and a PSBT_OUT_SCRIPT
+    filled in where the request had none.
+
+    Anything else is a ValueError rather than a response: the coordinator compares the
+    response field by field, and a field we cannot account for is one we must not send.
+    """
+    share_type, dleq_type = SEND_KEY_TYPES["global"]
+    if not has_own_bytes(psbt):
+        raise ValueError("the psbt's own bytes were not kept")
+    maps = _maps(psbt_bytes(psbt))
+    if len(maps) != 1 + len(psbt.inputs) + len(psbt.outputs):
+        raise ValueError("the psbt's own bytes describe another transaction")
+    request = maps[0][0]
+
+    add, replace = {}, {}
+    for key, value in psbt.unknown.items():
+        before = request.get(key)
+        if before == value:
+            continue
+        if before is None:
+            if key[0] not in (share_type, dleq_type):
+                raise ValueError("a global field was added that BIP-375 does not allow")
+            add[key] = value
+        else:
+            if key != GLOBAL_TX_MODIFIABLE or before[0] & ~0x03 != value[0] or value[0] & 0x03:
+                raise ValueError("a global field was changed that BIP-375 does not allow")
+            replace[key] = value
+    for key in request:
+        if key[0] in (GLOBAL_TX_MODIFIABLE[0], share_type, dleq_type) and key not in psbt.unknown:
+            raise ValueError("a global field of the request is missing from the response")
+
+    outputs = []
+    for (fields, _terminator, _records), out in zip(maps[1 + len(psbt.inputs):], psbt.outputs):
+        script = out.script_pubkey.data if out.script_pubkey else b""
+        before = fields.get(OUT_SCRIPT)
+        if before == script:
+            outputs.append({})
+        elif before is None:
+            outputs.append({OUT_SCRIPT: script})
+        else:
+            raise ValueError("an output script was changed, not filled in")
+    inputs = [fields for fields, _terminator, _records in maps[1:1 + len(psbt.inputs)]]
+    return add, replace, outputs, inputs
+
+
+def splice_response(psbt, global_add=None, global_replace=None, input_add=None,
+                    output_add=None) -> bytes:
+    """
+    The psbt's own bytes with records added before the terminator of the maps they
+    belong to, and named global records replaced in place. Every other byte, and the
+    order they came in, are the request's own.
+
+    Raises ValueError if the bytes kept do not describe this psbt, or if a record to
+    replace is not there to replace.
+    """
+    raw = getattr(psbt, _OWN_BYTES, None)
+    if raw is None:
+        raise ValueError("the psbt's own bytes were not kept")
+    maps = _maps(raw)
+    if len(maps) != 1 + len(psbt.inputs) + len(psbt.outputs):
+        raise ValueError("the psbt's own bytes describe another transaction")
+    additions = ([global_add or {}]
+                 + list(input_add or [{}] * len(psbt.inputs))
+                 + list(output_add or [{}] * len(psbt.outputs)))
+    if len(additions) != len(maps):
+        raise ValueError("additions do not match the psbt's maps")
+    replacements = global_replace or {}
+    for key in replacements:
+        if key not in maps[0][0]:
+            raise ValueError("a record to replace is not in the psbt's own bytes")
+
+    per_map = [replacements] + [{}] * (len(maps) - 1)
+    out, copied = bytearray(), 0
+    for (_fields, terminator, records), added, replaced in zip(maps, additions, per_map):
+        for key, _value, start, end in records:
+            replacement = replaced.get(key)
+            if replacement is None:
+                continue
+            out += raw[copied:start]
+            out += compact.to_bytes(len(key)) + key
+            out += compact.to_bytes(len(replacement)) + replacement
+            copied = end
+        out += raw[copied:terminator]
+        for key, value in added.items():
+            out += compact.to_bytes(len(key)) + key
+            out += compact.to_bytes(len(value)) + value
+        copied = terminator
+    out += raw[copied:]
+    return bytes(out)
+
+
+def _sign_input(psbt, index: int, kind: str, key) -> tuple:
+    """
+    One input's signature as the (field key, value) it goes in, made with SIGHASH_ALL
+    and checked against the key the prevout names before it is handed back.
+
+    BIP-375 requires SIGHASH_ALL on every input of a transaction with Silent Payment
+    outputs, because the computed output scripts depend on the whole input set.
+    """
+    message = psbt.sighash(index, sighash=SIGHASH.ALL)
+    if kind == "p2tr":
+        signature = key.schnorr_sign(message)
+        output_key = ec.PublicKey.from_xonly(psbt.inputs[index].utxo.script_pubkey.data[2:])
+        if not output_key.schnorr_verify(signature, message):
+            raise ValueError("input %d signature does not verify" % index)
+        return IN_TAP_KEY_SIG, signature.serialize() + bytes([SIGHASH.ALL])
+    signature = key.sign(message)
+    public_key = key.get_public_key()
+    if not public_key.verify(signature, message):
+        raise ValueError("input %d signature does not verify" % index)
+    return IN_PARTIAL_SIG + public_key.sec(), signature.serialize() + bytes([SIGHASH.ALL])
+
+
+def sign_send_inputs(psbt, seed, network: str) -> int:
+    """
+    Signs every input of a prepared BIP-375 send with SIGHASH_ALL, and answers with the
+    request's own bytes plus what this device added: the shares, proofs and output
+    scripts preparation computed, each input's signature, and its sighash type.
+
+    Taproot inputs are signed here rather than through embit's sign_with(), which puts
+    a key-path signature in PSBT_IN_FINAL_SCRIPTWITNESS -- a finalized field that
+    belongs to the coordinator, not a signer's PSBT_IN_TAP_KEY_SIG.
+
+    Every signature is made and checked before any of them is written, so on any
+    failure (ValueError) the psbt is unchanged. See psbt_bytes for the response.
+    """
+    keys = send_signing_keys(psbt, seed, network)
+    signatures = []
+    for index, (kind, key) in enumerate(keys):
+        signatures.append(_sign_input(psbt, index, kind, key))
+    del keys
+    global_add, global_replace, output_add, request_inputs = _response_changes(psbt)
+    input_add = []
+    for (field, value), fields in zip(signatures, request_inputs):
+        added = {field: value}
+        if IN_SIGHASH_TYPE not in fields:
+            # A request that states SIGHASH_ALL itself already has this record, and a
+            # psbt carrying it twice is one no parser will read back.
+            added[IN_SIGHASH_TYPE] = SIGHASH.ALL.to_bytes(4, "little")
+        input_add.append(added)
+    signed = splice_response(psbt, global_add=global_add, global_replace=global_replace,
+                             input_add=input_add, output_add=output_add)
+    for inp, (field, value) in zip(psbt.inputs, signatures):
+        if field == IN_TAP_KEY_SIG:
+            inp.unknown[IN_TAP_KEY_SIG] = value
+        else:
+            inp.partial_sigs[_point(field[1:])] = value
+        inp.sighash_type = SIGHASH.ALL
+    remember_bytes(psbt, signed)
+    return len(signatures)

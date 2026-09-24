@@ -1414,7 +1414,8 @@ class PSBTFinalizeView(View):
 
         sig_cnt = PSBTParser.sig_count(psbt)
         # BIP-376: every input is a Silent Payment spend the parser proved this seed's.
-        is_silent_payment = psbt_parser is not None and any(psbt_parser.silent_payment_inputs)
+        is_silent_payment = psbt_parser is not None and (
+            any(psbt_parser.silent_payment_inputs) or psbt_parser.silent_payment_send)
         logger.info(
             "PSBTFinalize: approve selected; signer_mode=%s initial_sig_count=%d inputs=%d",
             "card" if self.controller.psbt_sign_with_satochip else "seed",
@@ -1457,10 +1458,14 @@ class PSBTFinalizeView(View):
                     added, sign_result.timed_out,
                 )
             elif is_silent_payment:
-                # Never sign_with(), which walks every input. This signs all inputs or
-                # none, and adds only their PSBT_IN_TAP_KEY_SIG.
+                # Never sign_with(), which walks every input and, for a key-path Taproot
+                # input, writes a finalized witness. This signs all inputs or none, and
+                # adds only what a signer is entitled to add.
                 try:
-                    silent_payments.sign_spend_inputs(psbt, psbt_parser.seed, psbt_parser.network)
+                    if psbt_parser.silent_payment_send:
+                        silent_payments.sign_send_inputs(psbt, psbt_parser.seed, psbt_parser.network)
+                    else:
+                        silent_payments.sign_spend_inputs(psbt, psbt_parser.seed, psbt_parser.network)
                 except ValueError as e:
                     logger.info("PSBTFinalize: Silent Payment signing refused: %s", e)
             else:
