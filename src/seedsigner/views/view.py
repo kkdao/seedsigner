@@ -478,6 +478,13 @@ class RebootToLoaderView(View):
             if not self.keep_running:
                 return
 
+            # U-Boot's rockusb Loader mode does not always reach the host over
+            # USB, which left the BOOT button (case open) as the only way in.
+            # Erasing the boot block first makes the BootROM find no loader on
+            # the next boot and fall back to Maskrom, the same state the BOOT
+            # button forces. Flashing writes the boot block back.
+            _erase_boot_block()
+
             # busybox `reboot loader` ignores its mode argument, so issue the
             # reboot(2) RESTART2 syscall directly. "loader" maps to the Rockchip
             # device-tree reboot-mode entry; U-Boot then enters rockusb Loader mode.
@@ -491,6 +498,33 @@ class RebootToLoaderView(View):
                 "reboot-to-loader syscall returned %s (errno %s)",
                 rc, ctypes.get_errno(),
             )
+
+
+def _erase_boot_block():
+    """Erase the "idblock" MTD partition, where the BootROM looks for the loader."""
+    import fcntl
+    import os
+    import struct
+    try:
+        with open("/proc/mtd") as f:
+            for line in f:
+                # e.g. 'mtd1: 00040000 00020000 "idblock"'
+                fields = line.split()
+                if len(fields) == 4 and fields[3] == '"idblock"':
+                    device, size = "/dev/" + fields[0].rstrip(":"), int(fields[1], 16)
+                    break
+            else:
+                logger.error("no idblock partition in /proc/mtd")
+                return
+        MEMERASE = 0x40084D02  # _IOW('M', 2, struct erase_info_user)
+        fd = os.open(device, os.O_RDWR)
+        try:
+            fcntl.ioctl(fd, MEMERASE, struct.pack("II", 0, size))
+        finally:
+            os.close(fd)
+        logger.info("erased %s (%d bytes)", device, size)
+    except OSError as e:
+        logger.error("could not erase the boot block: %s", e)
 
 
 
