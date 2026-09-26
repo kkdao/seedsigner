@@ -504,6 +504,10 @@ class Controller(Singleton):
         # U-Boot boot-counter clear stays at Home, where it belongs.
         signal_app_alive()
 
+        # Test build only: record memory and kernel messages for a reset hunt.
+        from seedsigner.helpers import diag_recorder
+        diag_recorder.start()
+
         # Starting in chess shows no logo and nothing else that names the device.
         from seedsigner.views.chess_views import starts_in_chess
         chess_boot = starts_in_chess(Settings.get_instance())
