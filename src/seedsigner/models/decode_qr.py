@@ -32,6 +32,7 @@ from urtypes.crypto import Account, Output
 from urtypes.bytes import Bytes
 from base64 import b32encode, b32decode
 
+from seedsigner.helpers import silent_payments
 from seedsigner.helpers.ur2.ur_decoder import URDecoder
 from seedsigner.models.qr_type import QRType
 from seedsigner.models.seed import Seed
@@ -261,9 +262,13 @@ class DecodeQR:
             data = self.get_data_psbt()
             if data != None:
                 try:
-                    return psbt.PSBT.parse(data)
+                    parsed = psbt.PSBT.parse(data)
                 except:
                     return None
+                # A BIP-376 Silent Payment spend is answered with these bytes, so
+                # they are kept alongside what embit made of them.
+                silent_payments.remember_bytes(parsed, data)
+                return parsed
         return None
 
 

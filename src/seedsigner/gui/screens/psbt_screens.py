@@ -598,6 +598,10 @@ class PSBTAddressDetailsScreen(ButtonListScreen):
     address: str = None
     amount: int = 0
 
+    # Tried largest first; the last one is what a longer address than any in use today
+    # would fall back to, still whole but small.
+    ADDRESS_FONT_SIZES = (24, 22, 20, 18, 16, 14)
+
     def __post_init__(self):
         # Customize defaults
         self.is_bottom_list = True
@@ -618,15 +622,26 @@ class PSBTAddressDetailsScreen(ButtonListScreen):
             screen_y=int(GUIConstants.COMPONENT_PADDING/2),
         )
 
-        formatted_address = FormattedAddress(
-            image_draw=draw,
-            canvas=center_img,
-            width=self.canvas_width - 2*GUIConstants.EDGE_PADDING,
-            screen_x=GUIConstants.EDGE_PADDING,
-            screen_y=btc_amount.height + GUIConstants.COMPONENT_PADDING,
-            font_size=24,
-            address=self.address,
-        )
+        # A Silent Payment address is 116 characters (117 on testnet), nearly twice a
+        # Taproot one, and does not fit at the usual size: the screen used to crop
+        # whatever ran past the buttons, checksum included. This is the address the
+        # user compares against the one they were given, so the largest size that
+        # shows all of it is the one used.
+        address_y = btc_amount.height + GUIConstants.COMPONENT_PADDING
+        for font_size in self.ADDRESS_FONT_SIZES:
+            formatted_address = FormattedAddress(
+                image_draw=draw,
+                canvas=center_img,
+                width=self.canvas_width - 2*GUIConstants.EDGE_PADDING,
+                screen_x=GUIConstants.EDGE_PADDING,
+                screen_y=address_y,
+                font_size=font_size,
+                address=self.address,
+            )
+            if address_y + formatted_address.height <= center_img_height:
+                break
+        self.formatted_address = formatted_address
+        self.center_img_height = center_img_height
 
         # Render each to the temp img we passed in
         btc_amount.render()

@@ -12,6 +12,7 @@ from embit.ec import PublicKey
 from io import BytesIO
 from typing import List
 
+from seedsigner.helpers import silent_payments
 from seedsigner.models.seed import Seed
 from seedsigner.models.wif import WIFKey
 from seedsigner.models.settings import SettingsConstants
@@ -63,6 +64,12 @@ SEQUENCE_LOCKTIME_MASK = 0x0000FFFF
 # abusive rather than merely unusual. Legitimate long timelocks exist (vaults,
 # inheritance), but the user who set one up knows about it.
 FAR_FUTURE_LOCKTIME_SECONDS = 2 * 365 * 24 * 60 * 60
+
+def _as_sentence(reason) -> str:
+    """A helper's ValueError as a sentence for the screen, its own wording kept."""
+    text = str(reason)
+    return text[:1].upper() + text[1:] + "."
+
 
 # The only sighash flags that commit to the whole transaction. SIGHASH_DEFAULT
 # (0x00) is taproot's spelling of SIGHASH_ALL (BIP-341) and is valid only there.
@@ -181,6 +188,18 @@ class RejectCode:
     # transaction that would then produce no signatures. The view layer keeps the
     # psbt and routes back to seed selection -- see REJECT_PRESENTATION.
     SEED_CANNOT_SIGN = "SEED_CANNOT_SIGN"
+
+    # A Silent Payments psbt this version can't sign: BIP-375 send fields in any
+    # map, a BIP-376 spend that isn't v2, mixes in ordinary inputs, is malformed or
+    # carries fields the signature wouldn't commit to as written, or a signer that
+    # has no Silent Payments spend key (WIF/BIP38, smartcard, derived xprv).
+    UNSUPPORTED_SILENT_PAYMENT = "UNSUPPORTED_SILENT_PAYMENT"
+
+    # A BIP-376 spend input names this seed but its spend key, path, prevout or
+    # tweak does not prove it is this seed's coin, or other inputs belong to
+    # another seed. Signing with a coordinator's wrong tweak would sign for a key
+    # this seed doesn't own.
+    FOREIGN_SILENT_PAYMENT = "FOREIGN_SILENT_PAYMENT"
 
 
 class InvalidPSBTError(Exception):
@@ -325,6 +344,16 @@ class PSBTParser():
         self.verified_input_derivation_paths: List[List[int] | None] = []
         self.verified_output_derivation_paths: List[List[int] | None] = []
 
+        # Per input: whether it carries BIP-376 spend fields. Set in
+        # _scan_silent_payment_fields; once parse() returns, either none do or all
+        # do and every one is proven this seed's.
+        self.silent_payment_inputs: List[bool] = []
+
+        # A BIP-375 send, and one entry per Silent Payment output once it is prepared:
+        # {index, address, change, label}. See _prepare_silent_payment_send.
+        self.silent_payment_send: bool = False
+        self.silent_payment_recipients: List[dict] = []
+
         if self.seed is not None or self.root is not None:
             self.parse()
 
@@ -449,11 +478,18 @@ class PSBTParser():
             return False
 
         self._validate_psbt_version()
-        self._check_tx_modifiable()
-        self._assert_v2_complete()
+        self._scan_silent_payment_fields()
 
+        # A send arrives without its output scripts, so it is completed here: every
+        # check below, and every review screen, then sees the whole transaction. It
+        # needs this seed's keys, so the root comes first, and it signs nothing.
         if self.seed is not None and self.root is None:
             self._set_root()
+        self._prepare_silent_payment_send()
+
+        self._check_tx_modifiable()
+        self._assert_v2_complete()
+        self._verify_silent_payment_inputs()
 
         # A derivable BIP32 root is what makes verification possible at all. Without
         # one -- WIF/BIP38 signing, or a seedless multisig pre-parse -- no evidence can
@@ -778,6 +814,202 @@ class PSBTParser():
             f"PSBT version {version} is not supported.",
             code=RejectCode.UNSUPPORTED_PSBT_VERSION,
         )
+
+
+    def _scan_silent_payment_fields(self):
+        """
+        Silent Payments, stage 1: the fields alone, before anything reads the
+        transaction, so a psbt with no output script still gets this reason first.
+
+        Any BIP-375 (send) field in any map is refused. A psbt with BIP-376 spend
+        fields must be v2 with every input a spend (kiss-bdk's spspend.rs rule),
+        signed with SIGHASH_DEFAULT, and answerable with its own bytes. embit hashes
+        the transaction with `sequence or 0xffffffff` and `tx_version or 2` and
+        ignores BIP-370's per-input lock times, so a psbt relying on any of those is
+        refused rather than signed as a different transaction.
+
+        Each input must be a bare key-path spend, and neither it nor the global map
+        may carry anything else: a field already holding a signature or a script
+        path makes "did this add a signature?" meaningless, and a field embit skips
+        because its key is the wrong length for its type is one a coordinator reads.
+        """
+        def refuse(message):
+            raise InvalidPSBTError(message, code=RejectCode.UNSUPPORTED_SILENT_PAYMENT)
+
+        self.silent_payment_send = silent_payments.has_send_fields(self.psbt)
+        if self.silent_payment_send:
+            self._scan_silent_payment_send_fields(refuse)
+        self.silent_payment_inputs = [silent_payments.is_spend_input(inp) for inp in self.psbt.inputs]
+        if self.silent_payment_send:
+            # Spending a received Silent Payment coin to a Silent Payment address is one
+            # transaction, and the send's rules are the ones it answers to: SIGHASH_ALL
+            # rather than DEFAULT, and modifiable flags this device is the one to clear.
+            # Everything else the two have in common was checked above.
+            return
+        if not any(self.silent_payment_inputs):
+            return
+        if self.psbt.version != 2:
+            refuse("Silent Payment spends need a v2 PSBT.")
+        if not all(self.silent_payment_inputs):
+            refuse("Silent Payment inputs can't be mixed with others.")
+        if not self.psbt.tx_version:
+            refuse("This PSBT has no transaction version.")
+        if not silent_payments.has_own_bytes(self.psbt):
+            refuse("Silent Payment spends need the PSBT as received.")
+        if any(self.psbt.unknown.get(b"\x06", b"")):
+            # Not just the inputs/outputs bits _check_tx_modifiable reads: a
+            # coordinator refuses a response whose flags are anything but zero.
+            raise InvalidPSBTError(
+                "This transaction can still be changed after you sign.",
+                code=RejectCode.TX_MODIFIABLE,
+            )
+        for key in self.psbt.unknown:
+            if key != b"\x06":
+                refuse("This PSBT carries a global field of its own.")
+        for i, inp in enumerate(self.psbt.inputs):
+            if inp.sighash_type not in (None, SIGHASH_DEFAULT):
+                raise InvalidPSBTError(
+                    f"Input {i} needs sighash {inp.sighash_type:#04x}, not SIGHASH_DEFAULT.",
+                    code=RejectCode.UNSUPPORTED_SIGHASH,
+                )
+            if not inp.sequence:
+                refuse(f"Input {i} has no sequence number.")
+            if b"\x11" in inp.unknown or b"\x12" in inp.unknown:
+                refuse(f"Input {i} sets its own lock time.")
+            if silent_payments.IN_TAP_KEY_SIG in inp.unknown:
+                refuse(f"Input {i} is already signed.")
+            if (inp.partial_sigs or inp.final_scriptsig or inp.final_scriptwitness
+                    or inp.taproot_sigs or inp.taproot_scripts or inp.taproot_bip32_derivations
+                    or inp.taproot_internal_key or inp.taproot_merkle_root):
+                refuse(f"Input {i} carries signature or script data.")
+            for key in inp.unknown:
+                if key[0] not in (silent_payments.IN_SP_SPEND_BIP32_DERIVATION, silent_payments.IN_SP_TWEAK):
+                    refuse(f"Input {i} carries a field of its own.")
+
+
+    def _scan_silent_payment_send_fields(self, refuse):
+        """
+        Silent Payments, stage 1 for a send (BIP-375): the fields alone, before the
+        seed is involved.
+
+        A send arrives with the recipient's keys and no output script, so the usual
+        completeness checks cannot run until this device has computed the scripts. What
+        can be checked here is the shape of the request: v2, answerable with its own
+        bytes, every output's Silent Payment fields well-formed, SIGHASH_ALL (which
+        BIP-375 requires, absent meaning ALL), and nothing already signed.
+
+        A share from another signer (PSBT_IN_SP_ECDH_SHARE) is a collaborative send,
+        which needs a part of the input sum this device does not hold, so it is refused
+        rather than half-completed.
+        """
+        share_type, dleq_type = silent_payments.SEND_KEY_TYPES["global"]
+        if self.psbt.version != 2:
+            refuse("Silent Payment sends need a v2 PSBT.")
+        if not self.psbt.tx_version:
+            refuse("This PSBT has no transaction version.")
+        if not silent_payments.has_own_bytes(self.psbt):
+            refuse("Silent Payment sends need the PSBT as received.")
+        try:
+            recipients = silent_payments.send_recipients(self.psbt)
+        except ValueError as e:
+            refuse(_as_sentence(e))
+        if not recipients:
+            refuse("This PSBT has Silent Payment fields but no Silent Payment output.")
+        for key in self.psbt.unknown:
+            if key[0] not in (0x06, share_type, dleq_type):
+                refuse("This PSBT carries a global field of its own.")
+        for i, inp in enumerate(self.psbt.inputs):
+            if inp.sighash_type not in (None, SIGHASH_ALL):
+                raise InvalidPSBTError(
+                    f"Input {i} needs sighash {inp.sighash_type:#04x}, not SIGHASH_ALL.",
+                    code=RejectCode.UNSUPPORTED_SIGHASH,
+                )
+            if not inp.sequence:
+                refuse(f"Input {i} has no sequence number.")
+            if b"\x11" in inp.unknown or b"\x12" in inp.unknown:
+                refuse(f"Input {i} sets its own lock time.")
+            if (inp.partial_sigs or inp.final_scriptsig or inp.final_scriptwitness
+                    or inp.taproot_sigs or silent_payments.IN_TAP_KEY_SIG in inp.unknown):
+                refuse(f"Input {i} is already signed.")
+            for key in inp.unknown:
+                if key[0] in silent_payments.SEND_KEY_TYPES["input"]:
+                    refuse(f"Input {i} carries another signer's ECDH share.")
+                if key[0] not in (silent_payments.IN_SP_SPEND_BIP32_DERIVATION,
+                                  silent_payments.IN_SP_TWEAK):
+                    refuse(f"Input {i} carries a field of its own.")
+
+
+    def _prepare_silent_payment_send(self):
+        """
+        Silent Payments, stage 2 for a send: compute this transaction's Silent Payment
+        outputs, with the proof that they were computed honestly, and lock the
+        transaction. Nothing is signed here -- that waits for the user's approval.
+        """
+        if not self.silent_payment_send:
+            return
+        if not isinstance(self.seed, Seed):
+            raise InvalidPSBTError(
+                "This signer can't send to Silent Payment addresses.",
+                code=RejectCode.UNSUPPORTED_SILENT_PAYMENT,
+            )
+        try:
+            self.silent_payment_recipients = silent_payments.prepare_send(
+                self.psbt, self.seed, self.network
+            )
+        except ValueError as e:
+            code = RejectCode.UNSUPPORTED_SILENT_PAYMENT
+            message = str(e)
+            if "is not this seed's" in message:
+                logger.info("Silent Payment send refused: %s", message)
+                code = RejectCode.FOREIGN_SILENT_PAYMENT
+                message = "can't send to a Silent Payment address from inputs another wallet signs"
+            raise InvalidPSBTError(_as_sentence(message), code=code)
+
+
+    def _verify_silent_payment_inputs(self):
+        """
+        Silent Payments, stage 2, against the seed: each input's BIP-376 fields must
+        be well-formed and, where they name this seed, prove it owns the coin (see
+        silent_payments.spend_signing_key). No input naming this seed is the usual
+        "choose another seed"; a failed claim, or inputs of another seed alongside
+        this one's, is refused.
+        """
+        if not any(self.silent_payment_inputs):
+            return
+        if not isinstance(self.seed, Seed):
+            raise InvalidPSBTError(
+                "This signer can't sign Silent Payment inputs.",
+                code=RejectCode.UNSUPPORTED_SILENT_PAYMENT,
+            )
+        try:
+            fingerprint = silent_payments.master_fingerprint(self.seed, self.network)
+        except ValueError as e:
+            raise InvalidPSBTError(f"{e}.", code=RejectCode.UNSUPPORTED_SILENT_PAYMENT)
+
+        ours = []
+        for i, inp in enumerate(self.psbt.inputs):
+            try:
+                ours.append(silent_payments.spend_fields(inp)[1] == fingerprint)
+            except ValueError:
+                raise InvalidPSBTError(
+                    f"Input {i} has malformed Silent Payment fields.",
+                    code=RejectCode.UNSUPPORTED_SILENT_PAYMENT,
+                )
+        if not any(ours):
+            raise InvalidPSBTError(
+                "None of the inputs in this transaction are controlled by this seed.",
+                code=RejectCode.SEED_CANNOT_SIGN,
+            )
+        for i, inp in enumerate(self.psbt.inputs):
+            try:
+                if not ours[i]:
+                    raise ValueError("another seed's input")
+                silent_payments.spend_signing_key(self.seed, self.network, inp)
+            except ValueError:
+                raise InvalidPSBTError(
+                    f"Input {i} is not this seed's Silent Payment.",
+                    code=RejectCode.FOREIGN_SILENT_PAYMENT,
+                )
 
 
     def _check_tx_modifiable(self):
@@ -1273,6 +1505,11 @@ class PSBTParser():
         # over the course of the loop below, so grab them once now.
         vout = self.psbt.tx.vout
 
+        # A Silent Payment output is sorted by its code, not by a derivation path: the
+        # coordinator cannot annotate one, and the script this device just computed is
+        # the proof. Shown as the sp1... address the user was given, as BIP-375 asks.
+        silent_payment_outputs = {r["index"]: r for r in self.silent_payment_recipients}
+
         for i, out in enumerate(self.psbt.outputs):
             value = vout[i].value
             if not 0 <= value <= MAX_MONEY:
@@ -1280,6 +1517,23 @@ class PSBTParser():
                     f"Output {i} amount out of range: {value}",
                     code=RejectCode.AMOUNT_OUT_OF_RANGE,
                 )
+
+            recipient = silent_payment_outputs.get(i)
+            if recipient is not None:
+                if recipient["change"]:
+                    self.change_data.append({
+                        "output_index": i,
+                        "address": recipient["address"],
+                        "amount": value,
+                        "verified_derivation_path": None,
+                        "silent_payment": True,
+                    })
+                    self.change_amount += value
+                else:
+                    self.destination_addresses.append(recipient["address"])
+                    self.destination_amounts.append(value)
+                    self.spend_amount += value
+                continue
             out_policy = PSBTParser._get_policy(out, vout[i].script_pubkey, self.psbt.xpubs, child_key_derivation_cache)
             is_presumed_change = False
 
@@ -1817,6 +2071,10 @@ class PSBTParser():
             if inp.final_scriptwitness is not None:
                 # Taproot sign
                 cnt += 1
+            elif silent_payments.IN_TAP_KEY_SIG in inp.unknown:
+                # A Silent Payment spend (BIP-376) or send (BIP-375) is answered with
+                # PSBT_IN_TAP_KEY_SIG: finalising the witness is the coordinator's part.
+                cnt += 1
             else:
                 cnt += len(list(inp.partial_sigs.keys()))
 
@@ -2215,6 +2473,11 @@ class PSBTParser():
 
         # Check all derivations in all inputs
         for input in psbt.inputs:
+            # BIP-376 spend key origins: a routing hint like the rest.
+            for key, origin in input.unknown.items():
+                if key[0] == silent_payments.IN_SP_SPEND_BIP32_DERIVATION and hexlify(origin[:4]).decode() == seed_fingerprint:
+                    return True
+
             # Check regular BIP32 derivations
             for public_key, derivation_path_obj in input.bip32_derivations.items():
                 if check_fingerprint_match(public_key, derivation_path_obj, is_taproot=False):
@@ -2389,7 +2652,9 @@ class PSBTParser():
         verified and an empty result is not evidence of absence. WIF / BIP38 signing
         matches its key against the input script in _parse_inputs instead.
         """
-        if not self.can_verify_derivations:
+        if not self.can_verify_derivations or any(self.silent_payment_inputs):
+            # Silent Payment inputs were each proven this seed's (or refused) in
+            # _verify_silent_payment_inputs.
             return
 
         # An input names a key at a derivation path and _verify_claimed_derivation_paths

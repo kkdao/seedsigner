@@ -533,6 +533,7 @@ class SettingsConstants:
     SETTING__CAMERA_DEVICE = "camera_device"
     SETTING__COMPACT_SEEDQR = "compact_seedqr"
     SETTING__BIP85_CHILD_SEEDS = "bip85_child_seeds"
+    SETTING__SILENT_PAYMENTS = "silent_payments"
     SETTING__SLIP39_SEEDS = "slip39_seeds"
     SETTING__CHESS = "chess"
     SETTING__AEZEED_SEEDS = "aezeed_seeds"
@@ -1134,6 +1135,13 @@ class SettingsDefinition:
                       display_name=_mft("BIP-85 child seeds"),
                       visibility=SettingsConstants.VISIBILITY__ADVANCED,
                       default_value=SettingsConstants.OPTION__ENABLED),
+
+        SettingsEntry(category=SettingsConstants.CATEGORY__FEATURES,
+                      attr_name=SettingsConstants.SETTING__SILENT_PAYMENTS,
+                      abbreviated_name="silentpay",
+                      display_name=_mft("Silent Payments"),
+                      visibility=SettingsConstants.VISIBILITY__ADVANCED,
+                      default_value=SettingsConstants.OPTION__DISABLED),
 
         SettingsEntry(category=SettingsConstants.CATEGORY__FEATURES,
                       attr_name=SettingsConstants.SETTING__SLIP39_SEEDS,

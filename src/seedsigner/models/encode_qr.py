@@ -1,9 +1,12 @@
 import math
 
+import qrcode
+from PIL import Image
+
 from embit import bip32
 from embit.networks import NETWORKS
 from binascii import hexlify
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 from embit import bip32
 from embit.networks import NETWORKS
@@ -12,6 +15,7 @@ from seedsigner.helpers.ur2.ur_encoder import UREncoder
 from seedsigner.helpers.ur2.ur import UR
 from seedsigner.helpers.ur2.cbor_lite import CBOREncoder
 from urtypes.bytes import Bytes
+from seedsigner.helpers import silent_payments
 from seedsigner.helpers.qr import QR
 from seedsigner.models.seed import Seed
 from seedsigner.models.settings import SettingsConstants
@@ -140,6 +144,30 @@ class GenericStaticQrEncoder(BaseStaticQrEncoder):
 
     def next_part(self):
         return self.data
+
+
+
+@dataclass
+class InMemoryStaticQrEncoder(BaseStaticQrEncoder):
+    """
+    A static QR drawn entirely in memory, for secrets that must never reach a file.
+    The other encoders draw through QR.qrimage_io(), which writes the data to a temp
+    file for the qrencode binary.
+    """
+    data: str = field(default=None, repr=False)  # a secret: kept out of repr()
+
+    def next_part(self):
+        return self.data
+
+    def part_to_image(self, part, width, height, border: int = 3, background_color: str = "ffffff"):
+        # background_color is a hex triplet without the "#", as QRDisplayScreen passes it.
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=1, border=border)
+        qr.add_data(part)
+        qr.make(fit=True)
+        # Resized through qrcode's image wrapper, as QR.qrimage() does, so older qrcode
+        # releases without get_image() work too.
+        image = qr.make_image(fill_color="black", back_color="#" + background_color)
+        return image.resize((width, height), Image.Resampling.NEAREST).convert("RGBA")
 
 
 
@@ -400,7 +428,9 @@ class UrPsbtQrEncoder(BaseFountainQrEncoder):
 
     def __post_init__(self):
         super().__post_init__()
-        qr_ur_bytes = UR("crypto-psbt", UR_PSBT(self.psbt.serialize()).to_cbor())
+        # psbt_bytes, not serialize(): a signed Silent Payment spend goes back as
+        # the bytes it came in as, with only its signatures added.
+        qr_ur_bytes = UR("crypto-psbt", UR_PSBT(silent_payments.psbt_bytes(self.psbt)).to_cbor())
         self.ur2_encode = UREncoder(ur=qr_ur_bytes, max_fragment_len=self.qr_max_fragment_size)
 
 

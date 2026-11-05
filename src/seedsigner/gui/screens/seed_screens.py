@@ -670,6 +670,83 @@ class SeedExportXpubDetailsScreen(WarningEdgesMixin, ButtonListScreen):
 
 
 @dataclass
+class SeedSilentPaymentsDetailsScreen(ButtonListScreen):
+    """
+    What the scan-key export will describe, to check against Sparrow before it's
+    shown. The scan key itself never reaches this screen.
+    """
+    is_bottom_list: bool = True
+    fingerprint: str = None
+    network: str = None
+    derivation_path: str = "m/352'/0'/0'"
+    address: str = "sp1q..."
+
+    def __post_init__(self):
+        self.button_data = [ButtonOption("Export scan key")]
+        # TRANSLATOR_NOTE: Details of the Silent Payments wallet whose scan key is about to be exported
+        self.title = _("Scan Key Details")
+        super().__post_init__()
+
+        # As much of the address as fits: its start, then its checksum at the end.
+        font_size = GUIConstants.get_body_font_size() + 2
+        left, top, right, bottom = Fonts.get_font(GUIConstants.FIXED_WIDTH_FONT_NAME, font_size).getbbox("X")
+        num_chars = int((self.canvas_width - GUIConstants.ICON_FONT_SIZE - 2*GUIConstants.COMPONENT_PADDING) / (right - left)) - 3
+        address = f"{self.address[:num_chars - 7]}...{self.address[-7:]}"
+
+        # Unlabeled, like the Seed options title: four labeled rows don't fit above the
+        # button in the taller CJK and Devanagari fonts.
+        rows = [
+            dict(icon_name=SeedSignerIconConstants.FINGERPRINT, value_text=self.fingerprint),
+            dict(icon_name=SeedSignerIconConstants.BITCOIN_ALT, value_text=self.network),
+            dict(icon_name=SeedSignerIconConstants.DERIVATION, value_text=self.derivation_path),
+            dict(icon_name=FontAwesomeIconConstants.PAPER_PLANE, value_text=address,
+                 font_name=GUIConstants.FIXED_WIDTH_FONT_NAME, font_size=font_size),
+        ]
+        screen_y = self.top_nav.height + GUIConstants.COMPONENT_PADDING
+        for row in rows:
+            line = IconTextLine(icon_color=GUIConstants.INFO_COLOR, screen_x=GUIConstants.COMPONENT_PADDING, screen_y=screen_y, **row)
+            self.components.append(line)
+            screen_y += line.height + int(1.5*GUIConstants.COMPONENT_PADDING)
+
+
+
+@dataclass
+class SeedSilentPaymentsAddressScreen(ButtonListScreen):
+    """
+    The seed's public Silent Payment address, with its network, fingerprint and path,
+    and its start and checksum tail highlighted for checking against the wallet.
+    """
+    is_bottom_list: bool = True
+    network: str = None
+    fingerprint: str = None
+    derivation_path: str = "m/352'/0'/0'"
+    address: str = "sp1q..."
+
+    def __post_init__(self):
+        self.button_data = [ButtonOption("Show QR")]
+        # TRANSLATOR_NOTE: Title of the screen showing the seed's Silent Payment address
+        self.title = _("SP Address")
+        super().__post_init__()
+
+        screen_y = self.top_nav.height + GUIConstants.COMPONENT_PADDING
+        for icon_name, value in (
+                (SeedSignerIconConstants.BITCOIN_ALT, f"{self.network}  {self.fingerprint}"),
+                (SeedSignerIconConstants.DERIVATION, self.derivation_path)):
+            line = IconTextLine(icon_name=icon_name, icon_color=GUIConstants.INFO_COLOR, value_text=value,
+                                screen_x=GUIConstants.COMPONENT_PADDING, screen_y=screen_y)
+            self.components.append(line)
+            screen_y += line.height + GUIConstants.COMPONENT_PADDING
+
+        self.components.append(FormattedAddress(
+            address=self.address,
+            max_lines=3,
+            font_size=GUIConstants.get_body_font_size() + 2,
+            screen_y=screen_y + GUIConstants.COMPONENT_PADDING,
+        ))
+
+
+
+@dataclass
 class SeedAddPassphraseScreen(BaseTopNavScreen):
     passphrase: str = ""
 
